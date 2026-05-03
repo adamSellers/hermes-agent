@@ -705,6 +705,22 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "max_concurrency": 3,  # Clamp parallel summaries to avoid request-burst 429s on small providers
         },
+        "memory_extraction": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 45,
+            "extra_body": {},
+        },
+        "memory_embedding": {
+            "provider": "custom",
+            "model": "nomicai-modernbert-embed-base-bf16",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+        },
         "skills_hub": {
             "provider": "auto",
             "model": "",
@@ -893,9 +909,10 @@ DEFAULT_CONFIG = {
     # Context engine -- controls how the context window is managed when
     # approaching the model's token limit.
     # "compressor" = built-in lossy summarization (default).
-    # Set to a plugin name to activate an alternative engine (e.g. "lcm"
-    # for Lossless Context Management).  The engine must be installed as
-    # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
+    # Set to a plugin name to activate an alternative engine (for example,
+    # "cos-context" for hot/warm/cold chief-of-staff compression).  The
+    # engine must be installed as a plugin in plugins/context_engine/<name>/
+    # or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
     },
@@ -907,8 +924,8 @@ DEFAULT_CONFIG = {
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # External memory provider plugin (empty = built-in only).
-        # Set to a provider name to activate: "openviking", "mem0",
-        # "hindsight", "holographic", "retaindb", "byterover".
+        # Set to a provider name to activate: "cos-memory", "openviking",
+        # "mem0", "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
     },

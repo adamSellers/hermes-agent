@@ -1,0 +1,7 @@
+name: cos-memory
+version: 0.1.0
+description: "Chief-of-staff local memory provider: turn ledger and session recall."
+requires_env: []
+hooks:
+  - on_pre_compress
+  - on_session_end

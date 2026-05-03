@@ -405,3 +405,43 @@ def discover_plugin_cli_commands() -> List[dict]:
         logger.debug("Failed to scan CLI for memory plugin '%s': %s", active_provider, e)
 
     return results
+
+
+def discover_memory_cli_extension():
+    """Return nested ``hermes memory`` CLI registration for active provider.
+
+    Providers can expose ``register_memory_subcommands(memory_subparsers)`` in
+    their ``cli.py`` to add curation commands under the built-in
+    ``hermes memory`` command, while the older top-level plugin command path
+    continues to use ``register_cli(subparser)``.
+    """
+    active_provider = _get_active_memory_provider()
+    if not active_provider:
+        return None
+
+    plugin_dir = find_provider_dir(active_provider)
+    if not plugin_dir:
+        return None
+
+    cli_file = plugin_dir / "cli.py"
+    if not cli_file.exists():
+        return None
+
+    _is_bundled = _MEMORY_PLUGINS_DIR in plugin_dir.parents or plugin_dir.parent == _MEMORY_PLUGINS_DIR
+    module_name = f"plugins.memory.{active_provider}.cli" if _is_bundled else f"_hermes_user_memory.{active_provider}.cli"
+    try:
+        if module_name in sys.modules:
+            cli_mod = sys.modules[module_name]
+        else:
+            spec = importlib.util.spec_from_file_location(module_name, str(cli_file))
+            if not spec or not spec.loader:
+                return None
+            cli_mod = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = cli_mod
+            spec.loader.exec_module(cli_mod)
+        setup_fn = getattr(cli_mod, "register_memory_subcommands", None)
+        if callable(setup_fn):
+            return setup_fn
+    except Exception as e:
+        logger.debug("Failed to scan nested CLI for memory plugin '%s': %s", active_provider, e)
+    return None

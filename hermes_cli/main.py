@@ -1925,6 +1925,8 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("compression",      "Compression",      "context summarization"),
     ("web_extract",      "Web extract",      "web page summarization"),
     ("session_search",   "Session search",   "past-conversation recall"),
+    ("memory_extraction", "Memory extraction", "durable memory extraction"),
+    ("memory_embedding", "Memory embedding", "durable memory semantic search"),
     ("approval",         "Approval",         "smart command approval"),
     ("mcp",              "MCP",              "MCP tool reasoning"),
     ("title_generation", "Title generation", "session titles"),
@@ -9353,15 +9355,20 @@ Examples:
         help="Configure external memory provider",
         description=(
             "Set up and manage external memory provider plugins.\n\n"
-            "Available providers: honcho, openviking, mem0, hindsight,\n"
-            "holographic, retaindb, byterover.\n\n"
+            "Available providers: honcho, cos-memory, openviking, mem0,\n"
+            "hindsight, holographic, retaindb, byterover.\n\n"
             "Only one external provider can be active at a time.\n"
             "Built-in memory (MEMORY.md/USER.md) is always active."
         ),
     )
     memory_sub = memory_parser.add_subparsers(dest="memory_command")
-    memory_sub.add_parser(
+    _setup_memory_parser = memory_sub.add_parser(
         "setup", help="Interactive provider selection and configuration"
+    )
+    _setup_memory_parser.add_argument(
+        "provider",
+        nargs="?",
+        help="Optional provider name to configure directly (for example: cos-memory)",
     )
     memory_sub.add_parser("status", help="Show current memory provider config")
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")
@@ -9381,6 +9388,14 @@ Examples:
         default="all",
         help="Which store to reset: 'all' (default), 'memory', or 'user'",
     )
+    try:
+        from plugins.memory import discover_memory_cli_extension
+
+        _memory_cli_ext = discover_memory_cli_extension()
+        if _memory_cli_ext:
+            _memory_cli_ext(memory_sub)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("memory provider CLI extension failed: %s", _exc)
 
     def cmd_memory(args):
         sub = getattr(args, "memory_command", None)

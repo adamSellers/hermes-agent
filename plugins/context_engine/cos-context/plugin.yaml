@@ -1,0 +1,4 @@
+name: cos-context
+version: 0.1.0
+description: "Chief-of-staff context engine with hot/warm/cold compression."
+requires_env: []
