@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -11,7 +12,7 @@ from hermes_constants import get_hermes_home
 from plugins.memory import load_memory_provider
 
 
-def _provider():
+def _provider(*, start_workers: bool = False):
     provider = load_memory_provider("cos-memory")
     if provider is None:
         raise SystemExit("cos-memory provider could not be loaded")
@@ -20,6 +21,7 @@ def _provider():
         hermes_home=str(get_hermes_home()),
         platform="cli",
         agent_context="primary",
+        start_workers=start_workers,
     )
     return provider
 
@@ -46,6 +48,41 @@ def _print_items(items: Iterable[dict[str, Any]]) -> None:
         pin = " pinned" if item.get("pinned") else ""
         stale = " superseded" if item.get("superseded") else ""
         print(f"{item['ref']:<18} {item['kind']:<11}{pin}{stale}")
+        print(f"  {item['summary']}")
+    if not found:
+        print("No records.")
+
+
+def _format_time(value: Any) -> str:
+    try:
+        timestamp = float(value or 0)
+    except (TypeError, ValueError):
+        return "-"
+    if timestamp <= 0:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+
+def _format_score(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _print_debug_items(items: Iterable[dict[str, Any]]) -> None:
+    found = False
+    for item in items:
+        found = True
+        print(
+            f"{item['ref']:<18} {item['kind']:<11} "
+            f"source={item.get('source') or '-'} "
+            f"score={_format_score(item.get('score'))} "
+            f"lexical={_format_score(item.get('lexical_score'))} "
+            f"semantic={_format_score(item.get('semantic_score'))}"
+        )
         print(f"  {item['summary']}")
     if not found:
         print("No records.")
@@ -108,6 +145,20 @@ def cmd_stats(args) -> None:
                 print(f"  {status:<13} {count}")
         else:
             print("  empty")
+        stale_running = int(stats.get("queue_stale_running") or 0)
+        recovered = int(stats.get("queue_last_recovered_stale_running") or 0)
+        if stale_running or recovered:
+            print(f"  stale-running {stale_running}")
+            print(f"  recovered     {recovered}")
+        errors = stats.get("queue_errors") or []
+        if errors:
+            print("Queue errors:")
+            for error in errors:
+                print(
+                    f"  queue:{error.get('id')} {error.get('status')} "
+                    f"{error.get('job_type')} attempts={error.get('attempts', 0)}"
+                )
+                print(f"    {error.get('last_error') or ''}")
         embeddings = stats.get("embeddings", {})
         print("Embeddings:")
         print(f"  configured    {embeddings.get('configured', False)}")
@@ -120,6 +171,81 @@ def cmd_stats(args) -> None:
             "  memory        "
             f"{embeddings.get('memory_embedded', 0)}/{embeddings.get('memory_records', 0)}"
         )
+    finally:
+        provider.shutdown()
+
+
+def cmd_queue(args) -> None:
+    provider = _provider()
+    try:
+        action = getattr(args, "queue_action", "") or ""
+        if action == "retry-failed":
+            result = provider.retry_failed_jobs(limit=getattr(args, "limit", 0) or 0)
+            if getattr(args, "json", False):
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return
+            print(f"Requeued {result.get('retried', 0)} failed job(s).")
+            return
+        if action == "recover-stale":
+            recovered = provider.recover_stale_queue_jobs(
+                stale_after_seconds=getattr(args, "stale_after", 300) or 300
+            )
+            result = provider.queue_status(
+                status=getattr(args, "status", "") or "",
+                limit=getattr(args, "limit", 50),
+            )
+            result["recovered_stale_running"] = recovered
+            if getattr(args, "json", False):
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return
+            print(f"Recovered {recovered} stale running job(s).")
+            if not (getattr(args, "status", "") or ""):
+                args.status = "pending"
+
+        status = (
+            "failed"
+            if getattr(args, "failed", False)
+            else (getattr(args, "status", "") or "")
+        )
+        result = provider.queue_status(
+            status=status,
+            limit=getattr(args, "limit", 50),
+            include_done=getattr(args, "done", False),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return
+
+        counts = result.get("counts", {})
+        print("Queue:")
+        for queue_status in ("pending", "running", "failed"):
+            print(f"  {queue_status:<13} {counts.get(queue_status, 0)}")
+        recovered = int(result.get("recovered_stale_running") or 0)
+        if recovered:
+            print(f"  recovered     {recovered}")
+
+        jobs = result.get("jobs") or []
+        if not jobs:
+            print("No queue jobs.")
+            return
+        for job in jobs:
+            target = ""
+            if job.get("target_table") and job.get("target_row_id") is not None:
+                target = f" target={job.get('target_table')}:{job.get('target_row_id')}"
+            turn = ""
+            if job.get("turn_id") is not None:
+                turn = f" turn={job.get('turn_id')}"
+            session = f" session={job.get('session_id')}" if job.get("session_id") else ""
+            print(
+                f"queue:{job.get('id')} {job.get('status')} {job.get('job_type')}"
+                f"{session}{turn}{target} attempts={job.get('attempts', 0)}"
+            )
+            print(
+                f"  run_after={_format_time(job.get('run_after'))} "
+                f"updated={_format_time(job.get('updated_at'))}"
+            )
+            if job.get("last_error"):
+                print(f"  error: {job.get('last_error')}")
     finally:
         provider.shutdown()
 
@@ -158,7 +284,33 @@ def cmd_search(args) -> None:
     try:
         kinds = set(getattr(args, "kind", []) or [])
         items = provider.search_memory(args.query, kinds=kinds, limit=args.limit)
-        _print_items(items)
+        if getattr(args, "debug", False):
+            _print_debug_items(items)
+        else:
+            _print_items(items)
+    finally:
+        provider.shutdown()
+
+
+def cmd_doctor(args) -> None:
+    provider = _provider()
+    try:
+        result = provider.memory_doctor(limit=getattr(args, "limit", 100))
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return
+        findings = result.get("findings") or []
+        if not findings:
+            print("No doctor findings.")
+            return
+        print(f"Memory doctor: {len(findings)} finding(s)")
+        for item in findings:
+            print(
+                f"{item.get('severity', 'warn'):<5} {item.get('ref', '-'):<18} "
+                f"{item.get('code', 'unknown')} - {item.get('detail', '')}"
+            )
+        if result.get("truncated"):
+            print("More findings not shown; raise --limit to inspect.")
     finally:
         provider.shutdown()
 
@@ -332,9 +484,11 @@ def cos_memory_command(args) -> None:
         "enable": cmd_enable,
         "disable": cmd_disable,
         "stats": cmd_stats,
+        "queue": cmd_queue,
         "list": cmd_list,
         "show": cmd_show,
         "search": cmd_search,
+        "doctor": cmd_doctor,
         "remember": cmd_remember,
         "pin": cmd_pin,
         "unpin": cmd_pin,
@@ -370,6 +524,20 @@ def _add_commands(subs, *, set_func: bool) -> None:
     stats = subs.add_parser("stats", help="Show cos-memory database and queue stats")
     stats.add_argument("--json", action="store_true", help="Print raw JSON")
 
+    queue = subs.add_parser("queue", help="Show background queue jobs and failures")
+    queue.add_argument(
+        "queue_action",
+        nargs="?",
+        choices=["retry-failed", "recover-stale"],
+        help="Queue action to run",
+    )
+    queue.add_argument("--failed", action="store_true", help="Only show failed jobs")
+    queue.add_argument("--status", choices=["pending", "running", "failed", "done"], help="Filter by status")
+    queue.add_argument("--limit", type=int, default=50, help="Maximum jobs to show or retry")
+    queue.add_argument("--done", action="store_true", help="Include done jobs in queue listings")
+    queue.add_argument("--stale-after", type=int, default=300, help="Seconds before a running job is stale")
+    queue.add_argument("--json", action="store_true", help="Print raw JSON")
+
     list_parser = subs.add_parser("list", help="List durable memories")
     list_parser.add_argument("--kind", choices=["entity", "fact", "preference", "commitment", "relation"])
     list_parser.add_argument("--limit", type=int, default=50)
@@ -383,6 +551,11 @@ def _add_commands(subs, *, set_func: bool) -> None:
     search.add_argument("query")
     search.add_argument("--kind", action="append", choices=["entity", "fact", "preference", "commitment", "relation"])
     search.add_argument("--limit", type=int, default=20)
+    search.add_argument("--debug", action="store_true", help="Show recall source and score details")
+
+    doctor = subs.add_parser("doctor", help="Check durable memory hygiene")
+    doctor.add_argument("--limit", type=int, default=100)
+    doctor.add_argument("--json", action="store_true", help="Print raw JSON")
 
     remember = subs.add_parser("remember", help="Manually add a durable memory from JSON")
     remember.add_argument("kind", choices=["entity", "fact", "preference", "commitment"])

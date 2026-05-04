@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 from types import SimpleNamespace
 
 from hermes_state import SessionDB
@@ -10,6 +11,18 @@ def _provider(tmp_path, session_id="s1"):
     provider = load_memory_provider("cos-memory")
     assert provider is not None
     provider.initialize(session_id=session_id, hermes_home=str(tmp_path), platform="cli")
+    return provider
+
+
+def _provider_without_workers(tmp_path, session_id="s1"):
+    provider = load_memory_provider("cos-memory")
+    assert provider is not None
+    provider.initialize(
+        session_id=session_id,
+        hermes_home=str(tmp_path),
+        platform="cli",
+        start_workers=False,
+    )
     return provider
 
 
@@ -88,6 +101,174 @@ def test_sync_turn_records_stable_turn_ids_across_restart(tmp_path):
     assert {row["compression_state"] for row in rows} == {"hot"}
     assert {row["session_embedding_status"] for row in rows} <= {"pending", "done"}
     assert {row["extraction_status"] for row in rows} <= {"pending", "done"}
+
+
+def test_memory_stats_exposes_queue_counts_and_errors(tmp_path):
+    provider = _provider_without_workers(tmp_path, session_id="s1")
+    assert provider._conn is not None
+    now = time.time()
+    with provider._lock:
+        provider._conn.execute(
+            """
+            INSERT INTO memory_work_queue(
+                job_type, session_id, turn_id, payload, status, attempts,
+                run_after, last_error, created_at, updated_at
+            ) VALUES ('embed_turn', 's1', 1, '{}', 'pending', 1, ?, 'transient embed error', ?, ?)
+            """,
+            (now + 3600, now, now),
+        )
+        provider._conn.execute(
+            """
+            INSERT INTO memory_work_queue(
+                job_type, session_id, turn_id, payload, status, attempts,
+                run_after, last_error, created_at, updated_at
+            ) VALUES ('extract_turn', 's1', 2, '{}', 'failed', 3, ?, 'extract exploded', ?, ?)
+            """,
+            (now, now, now),
+        )
+        provider._conn.execute(
+            """
+            INSERT INTO memory_work_queue(
+                job_type, session_id, turn_id, payload, status, attempts,
+                run_after, created_at, updated_at
+            ) VALUES ('consolidate', 's1', NULL, '{}', 'running', 1, ?, ?, ?)
+            """,
+            (now, now, now),
+        )
+
+    stats = provider.memory_stats()
+    provider.shutdown()
+
+    assert stats["queue"]["pending"] == 1
+    assert stats["queue"]["running"] == 1
+    assert stats["queue"]["failed"] == 1
+    errors = {(row["status"], row["last_error"]) for row in stats["queue_errors"]}
+    assert ("failed", "extract exploded") in errors
+    assert ("pending", "transient embed error") in errors
+
+
+def test_queue_status_reports_stale_running_jobs_without_recovery(tmp_path):
+    provider = _provider_without_workers(tmp_path, session_id="s1")
+    assert provider._conn is not None
+    now = time.time()
+    with provider._lock:
+        provider._conn.execute(
+            """
+            INSERT INTO memory_work_queue(
+                job_type, session_id, turn_id, payload, status, attempts,
+                run_after, created_at, updated_at
+            ) VALUES ('embed_turn', 's1', 1, '{}', 'running', 1, ?, ?, ?)
+            """,
+            (now + 3600, now - 600, now - 600),
+        )
+
+    result = provider.queue_status()
+    row = provider._conn.execute(
+        "SELECT status, last_error FROM memory_work_queue"
+    ).fetchone()
+    provider.shutdown()
+
+    assert result["stale_running"] == 1
+    assert result["recovered_stale_running"] == 0
+    assert result["counts"]["running"] == 1
+    assert row["status"] == "running"
+    assert row["last_error"] is None
+
+
+def test_recover_stale_queue_jobs_is_explicit(tmp_path):
+    provider = _provider_without_workers(tmp_path, session_id="s1")
+    assert provider._conn is not None
+    now = time.time()
+    with provider._lock:
+        provider._conn.execute(
+            """
+            INSERT INTO memory_work_queue(
+                job_type, session_id, turn_id, payload, status, attempts,
+                run_after, created_at, updated_at
+            ) VALUES ('embed_turn', 's1', 1, '{}', 'running', 1, ?, ?, ?)
+            """,
+            (now + 3600, now - 600, now - 600),
+        )
+
+    recovered = provider.recover_stale_queue_jobs(stale_after_seconds=300)
+    result = provider.queue_status()
+    row = provider._conn.execute(
+        "SELECT status, last_error FROM memory_work_queue"
+    ).fetchone()
+    provider.shutdown()
+
+    assert recovered == 1
+    assert result["counts"]["pending"] == 1
+    assert result["stale_running"] == 0
+    assert row["status"] == "pending"
+    assert row["last_error"] == "recovered stale running job"
+
+
+def test_retry_failed_jobs_requeues_and_resets_attempts(tmp_path):
+    provider = _provider_without_workers(tmp_path, session_id="s1")
+    assert provider._conn is not None
+    now = time.time()
+    with provider._lock:
+        first = provider._conn.execute(
+            """
+            INSERT INTO memory_work_queue(
+                job_type, session_id, turn_id, payload, status, attempts,
+                run_after, last_error, created_at, updated_at
+            ) VALUES ('extract_turn', 's1', 1, '{}', 'failed', 3, ?, 'first failure', ?, ?)
+            """,
+            (now + 3600, now - 10, now - 10),
+        ).lastrowid
+        provider._conn.execute(
+            """
+            INSERT INTO memory_work_queue(
+                job_type, session_id, turn_id, payload, status, attempts,
+                run_after, last_error, created_at, updated_at
+            ) VALUES ('extract_turn', 's1', 2, '{}', 'failed', 3, ?, 'second failure', ?, ?)
+            """,
+            (now + 3600, now, now),
+        )
+
+    result = provider.retry_failed_jobs(limit=1)
+    rows = provider._conn.execute(
+        "SELECT id, status, attempts, last_error FROM memory_work_queue ORDER BY id"
+    ).fetchall()
+    provider.shutdown()
+
+    assert result["retried"] == 1
+    assert result["job_ids"] == [first]
+    assert [(row["status"], row["attempts"], row["last_error"]) for row in rows] == [
+        ("pending", 0, None),
+        ("failed", 3, "second failure"),
+    ]
+
+
+def test_claim_job_is_single_consumer(tmp_path):
+    provider = _provider_without_workers(tmp_path, session_id="s1")
+    assert provider._conn is not None
+    now = time.time()
+    with provider._lock:
+        provider._conn.execute(
+            """
+            INSERT INTO memory_work_queue(
+                job_type, session_id, turn_id, payload, status, attempts,
+                run_after, created_at, updated_at
+            ) VALUES ('extract_turn', 's1', 1, '{}', 'pending', 0, ?, ?, ?)
+            """,
+            (now, now, now),
+        )
+
+    first = provider._claim_job()
+    second = provider._claim_job()
+    row = provider._conn.execute(
+        "SELECT status, attempts FROM memory_work_queue"
+    ).fetchone()
+    provider.shutdown()
+
+    assert first is not None
+    assert first["status"] == "running"
+    assert second is None
+    assert row["status"] == "running"
+    assert row["attempts"] == 1
 
 
 def test_recall_session_searches_current_session_fts_only(tmp_path):
@@ -504,3 +685,59 @@ def test_heuristic_skips_malformed_contact_attribute(tmp_path):
     provider.shutdown()
 
     assert recalled == "No durable memory results."
+
+
+def test_memory_doctor_flags_malformed_names_and_embedding_hygiene(tmp_path):
+    provider = _provider(tmp_path, session_id="s1")
+    assert provider._conn is not None
+    now = 123.0
+    with provider._lock:
+        entity_cur = provider._conn.execute(
+            """
+            INSERT INTO entities(
+                type, canonical_name, aliases, attributes, first_seen,
+                last_seen, salience
+            ) VALUES ('person', 'user_friend_and_her_email_address', '[]', '{}', ?, ?, 0.1)
+            """,
+            (now, now),
+        )
+        entity_id = int(entity_cur.lastrowid)
+        fact_cur = provider._conn.execute(
+            """
+            INSERT INTO facts(
+                subject_entity_id, predicate, object_value, confidence,
+                source_session_id, source_turn_id, created_at,
+                last_confirmed_at, superseded_at
+            ) VALUES (?, 'email_address', 'old@example.com', 0.8, 's1', 1, ?, ?, ?)
+            """,
+            (entity_id, now, now, now),
+        )
+        fact_id = int(fact_cur.lastrowid)
+        provider._conn.execute(
+            """
+            INSERT INTO memory_embedding_records(
+                kind, row_id, text, embedding_model, embedding_vector,
+                embedded_at, created_at, updated_at
+            ) VALUES ('fact', ?, 'stale fact text', 'test-embed', '[1.0,0.0]', ?, ?, ?)
+            """,
+            (fact_id, now, now, now),
+        )
+    provider._embedding_config = lambda: {"configured": True, "model": "test-embed"}
+
+    result = provider.memory_doctor(limit=20)
+    provider.shutdown()
+
+    findings = result["findings"]
+    assert result["ok"] is False
+    assert any(
+        item["ref"] == f"entity:{entity_id}" and item["code"] == "malformed_entity_name"
+        for item in findings
+    )
+    assert any(
+        item["ref"] == f"entity:{entity_id}" and item["code"] == "missing_embedding"
+        for item in findings
+    )
+    assert any(
+        item["ref"] == f"fact:{fact_id}" and item["code"] == "superseded_embedding"
+        for item in findings
+    )

@@ -35,6 +35,31 @@ logger = logging.getLogger(__name__)
 
 MEMORY_VECTOR_MIN_SCORE = 0.42
 MEMORY_VECTOR_WITH_LEXICAL_MIN_SCORE = 0.50
+RELATIONISH_ENTITY_NAME_TOKENS = {
+    "and",
+    "email",
+    "address",
+    "phone",
+    "mobile",
+    "friend",
+    "partner",
+    "spouse",
+    "wife",
+    "husband",
+    "colleague",
+    "manager",
+    "mother",
+    "father",
+    "sister",
+    "brother",
+    "daughter",
+    "son",
+    "her",
+    "his",
+    "their",
+    "my",
+    "user",
+}
 
 
 RECALL_SESSION_SCHEMA = {
@@ -439,6 +464,8 @@ class CosMemoryProvider(MemoryProvider):
         self._worker_count = 1
         self._max_job_attempts = 3
         self._job_retry_base_seconds = 30
+        self._stale_job_seconds = 300
+        self._last_stale_jobs_recovered = 0
         self._briefing_cache = ""
         self._briefing_cache_at = 0.0
 
@@ -489,7 +516,8 @@ class CosMemoryProvider(MemoryProvider):
         self._session_db = SessionDB(self._state_db_path)
         self._initialized = True
         self._shutdown.clear()
-        self._start_workers()
+        if kwargs.get("start_workers", True):
+            self._start_workers()
 
     def _run_migrations(self) -> None:
         assert self._conn is not None
@@ -529,19 +557,27 @@ class CosMemoryProvider(MemoryProvider):
             thread.start()
             self._workers.append(thread)
 
-    def _recover_stale_jobs(self) -> None:
+    def _recover_stale_jobs(self, stale_after_seconds: Optional[int] = None) -> int:
         if self._conn is None:
-            return
-        cutoff = _now() - 300
+            return 0
+        stale_after = self._stale_job_seconds if stale_after_seconds is None else stale_after_seconds
+        cutoff = _now() - max(1, int(stale_after or self._stale_job_seconds))
+        now = _now()
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 """
                 UPDATE memory_work_queue
-                SET status = 'pending', updated_at = ?
+                SET status = 'pending',
+                    last_error = COALESCE(NULLIF(TRIM(last_error), ''), 'recovered stale running job'),
+                    updated_at = ?
                 WHERE status = 'running' AND updated_at < ?
                 """,
-                (_now(), cutoff),
+                (now, cutoff),
             )
+            recovered = int(cur.rowcount or 0)
+            if recovered:
+                self._last_stale_jobs_recovered = recovered
+            return recovered
 
     def _worker_loop(self) -> None:
         while not self._shutdown.is_set():
@@ -561,26 +597,56 @@ class CosMemoryProvider(MemoryProvider):
             return None
         now = _now()
         with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT * FROM memory_work_queue
-                WHERE status = 'pending' AND run_after <= ?
-                ORDER BY created_at, id
-                LIMIT 1
-                """,
-                (now,),
-            ).fetchone()
-            if row is None:
+            committed = False
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    """
+                    SELECT id FROM memory_work_queue
+                    WHERE status = 'pending' AND run_after <= ?
+                    ORDER BY created_at, id
+                    LIMIT 1
+                    """,
+                    (now,),
+                ).fetchone()
+                if row is None:
+                    self._conn.execute("COMMIT")
+                    committed = True
+                    return None
+                cur = self._conn.execute(
+                    """
+                    UPDATE memory_work_queue
+                    SET status = 'running', attempts = attempts + 1, updated_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (now, row["id"]),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    self._conn.execute("ROLLBACK")
+                    committed = True
+                    return None
+                claimed = self._conn.execute(
+                    "SELECT * FROM memory_work_queue WHERE id = ?",
+                    (row["id"],),
+                ).fetchone()
+                self._conn.execute("COMMIT")
+                committed = True
+                return dict(claimed) if claimed is not None else None
+            except sqlite3.OperationalError as exc:
+                if not committed:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                logger.debug("cos-memory queue claim skipped: %s", exc)
                 return None
-            self._conn.execute(
-                """
-                UPDATE memory_work_queue
-                SET status = 'running', attempts = attempts + 1, updated_at = ?
-                WHERE id = ?
-                """,
-                (now, row["id"]),
-            )
-            return dict(row)
+            except sqlite3.Error:
+                if not committed:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                raise
 
     def _mark_job_done(self, job_id: int) -> None:
         if self._conn is None:
@@ -606,6 +672,142 @@ class CosMemoryProvider(MemoryProvider):
                 """,
                 (status, _now() + delay, error[:500], _now(), job["id"]),
             )
+
+    def _queue_counts_locked(self) -> Dict[str, int]:
+        assert self._conn is not None
+        counts = {"pending": 0, "running": 0, "failed": 0, "done": 0}
+        rows = self._conn.execute(
+            "SELECT status, COUNT(*) AS n FROM memory_work_queue GROUP BY status"
+        ).fetchall()
+        for row in rows:
+            counts[str(row["status"])] = int(row["n"])
+        return counts
+
+    def _queue_errors_locked(self, limit: int = 5) -> List[Dict[str, Any]]:
+        assert self._conn is not None
+        rows = self._conn.execute(
+            """
+            SELECT id, job_type, status, session_id, turn_id, target_table,
+                   target_row_id, attempts, run_after, last_error, created_at,
+                   updated_at
+            FROM memory_work_queue
+            WHERE status IN ('pending', 'running', 'failed')
+              AND last_error IS NOT NULL
+              AND TRIM(last_error) != ''
+            ORDER BY
+                CASE status
+                    WHEN 'failed' THEN 0
+                    WHEN 'running' THEN 1
+                    WHEN 'pending' THEN 2
+                    ELSE 3
+                END,
+                updated_at DESC,
+                id DESC
+            LIMIT ?
+            """,
+            (_clamp_int(limit, 5, 1, 50),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def queue_status(
+        self,
+        *,
+        status: str = "",
+        limit: int = 50,
+        include_done: bool = False,
+    ) -> Dict[str, Any]:
+        """Return visible queue jobs and reliability counters for curation CLI."""
+        if self._conn is None:
+            return {}
+        status = (status or "").strip().lower()
+        if status and status not in {"pending", "running", "failed", "done"}:
+            raise ValueError(f"unsupported queue status {status!r}")
+        limit = _clamp_int(limit, 50, 1, 200)
+        with self._lock:
+            counts = self._queue_counts_locked()
+            cutoff = _now() - self._stale_job_seconds
+            stale_running = int(
+                self._conn.execute(
+                    """
+                    SELECT COUNT(*) FROM memory_work_queue
+                    WHERE status = 'running' AND updated_at < ?
+                    """,
+                    (cutoff,),
+                ).fetchone()[0]
+            )
+            params: List[Any] = []
+            where = ""
+            if status:
+                where = "WHERE status = ?"
+                params.append(status)
+            elif not include_done:
+                where = "WHERE status IN ('pending', 'running', 'failed')"
+            rows = self._conn.execute(
+                f"""
+                SELECT id, job_type, status, session_id, turn_id, target_table,
+                       target_row_id, attempts, run_after, last_error, created_at,
+                       updated_at
+                FROM memory_work_queue
+                {where}
+                ORDER BY
+                    CASE status
+                        WHEN 'failed' THEN 0
+                        WHEN 'running' THEN 1
+                        WHEN 'pending' THEN 2
+                        WHEN 'done' THEN 3
+                        ELSE 4
+                    END,
+                    updated_at DESC,
+                    id DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+            errors = self._queue_errors_locked(limit=5)
+        return {
+            "counts": counts,
+            "errors": errors,
+            "jobs": [dict(row) for row in rows],
+            "limit": limit,
+            "stale_running": stale_running,
+            "recovered_stale_running": 0,
+            "last_recovered_stale_running": self._last_stale_jobs_recovered,
+        }
+
+    def retry_failed_jobs(self, *, limit: int = 0) -> Dict[str, Any]:
+        """Requeue failed jobs when the user explicitly requests a retry."""
+        if self._conn is None:
+            return {}
+        limit = max(0, _clamp_int(limit, 0, 0, 1000))
+        with self._lock:
+            sql = """
+                SELECT id FROM memory_work_queue
+                WHERE status = 'failed'
+                ORDER BY updated_at, id
+            """
+            params: List[Any] = []
+            if limit:
+                sql += " LIMIT ?"
+                params.append(limit)
+            ids = [int(row["id"]) for row in self._conn.execute(sql, params).fetchall()]
+            if ids:
+                now = _now()
+                placeholders = ",".join("?" for _ in ids)
+                self._conn.execute(
+                    f"""
+                    UPDATE memory_work_queue
+                    SET status = 'pending',
+                        attempts = 0,
+                        run_after = ?,
+                        last_error = NULL,
+                        updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (now, now, *ids),
+                )
+            counts = self._queue_counts_locked()
+            errors = self._queue_errors_locked(limit=5)
+        return {"retried": len(ids), "job_ids": ids, "counts": counts, "errors": errors}
 
     def _process_job(self, job: Dict[str, Any]) -> None:
         job_type = job.get("job_type")
@@ -1380,6 +1582,24 @@ class CosMemoryProvider(MemoryProvider):
         contact_terms = ("email", "e_mail", "phone", "mobile", "address")
         return any(term in predicate for term in contact_terms)
 
+    def _looks_like_relationish_entity_name(self, name: str) -> bool:
+        lowered = (name or "").strip().lower()
+        if not lowered:
+            return False
+        tokens = [token for token in re.split(r"[^a-z0-9]+", lowered) if token]
+        if len(tokens) < 2:
+            return False
+        token_set = set(tokens)
+        relationish_count = len(token_set & RELATIONISH_ENTITY_NAME_TOKENS)
+        has_relation_phrase = (
+            "and" in token_set
+            or {"email", "address"} <= token_set
+            or "phone" in token_set
+            or "mobile" in token_set
+        )
+        has_synthetic_subject = token_set & {"user", "my", "her", "his", "their"}
+        return relationish_count >= 2 and (has_relation_phrase or bool(has_synthetic_subject))
+
     def consolidate_pending(self, session_id: str = "") -> int:
         if self._conn is None:
             return 0
@@ -1952,6 +2172,9 @@ class CosMemoryProvider(MemoryProvider):
 
     def search_memory(self, query: str, *, kinds: Optional[set] = None, limit: int = 20) -> List[Dict[str, Any]]:
         lexical = self._search_memory_lexical(query, kinds=kinds, limit=max(limit * 2, limit))
+        for item in lexical:
+            item.setdefault("source", "fts")
+            item.setdefault("lexical_score", float(item.get("score") or 0.0))
         vector = self._search_memory_vector(query, kinds=kinds, limit=max(limit * 2, limit))
         if not vector:
             return lexical[:limit]
@@ -2433,6 +2656,9 @@ class CosMemoryProvider(MemoryProvider):
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def recover_stale_queue_jobs(self, *, stale_after_seconds: int = 300) -> int:
+        return self._recover_stale_jobs(stale_after_seconds)
+
     def memory_stats(self) -> Dict[str, Any]:
         if self._conn is None:
             return {}
@@ -2446,11 +2672,33 @@ class CosMemoryProvider(MemoryProvider):
             stats["staging_pending"] = self._conn.execute(
                 "SELECT COUNT(*) FROM staging_extractions WHERE consolidated_at IS NULL"
             ).fetchone()[0]
-            stats["queue"] = {
-                row["status"]: int(row["n"])
-                for row in self._conn.execute(
-                    "SELECT status, COUNT(*) AS n FROM memory_work_queue GROUP BY status"
-                ).fetchall()
+            stats["queue"] = self._queue_counts_locked()
+            stats["queue_errors"] = self._queue_errors_locked(limit=5)
+            stale_running = int(
+                self._conn.execute(
+                    """
+                    SELECT COUNT(*) FROM memory_work_queue
+                    WHERE status = 'running' AND updated_at < ?
+                    """,
+                    (_now() - self._stale_job_seconds,),
+                ).fetchone()[0]
+            )
+            stats["queue_stale_running"] = stale_running
+            stats["queue_last_recovered_stale_running"] = self._last_stale_jobs_recovered
+            stats["queue_detail"] = {
+                "failed_recent": [
+                    {
+                        "id": int(error["id"]),
+                        "job_type": error["job_type"],
+                        "attempts": int(error["attempts"] or 0),
+                        "last_error": error["last_error"] or "",
+                    }
+                    for error in stats["queue_errors"]
+                    if error.get("status") == "failed"
+                ],
+                "stale_running": stale_running,
+                "last_recovered_stale_running": self._last_stale_jobs_recovered,
+                "errors": stats["queue_errors"],
             }
             stats["memory"] = {}
             for table in ("entities", "facts", "preferences", "commitments", "relations"):
@@ -2474,6 +2722,227 @@ class CosMemoryProvider(MemoryProvider):
                 ).fetchone()[0],
             }
         return stats
+
+    def memory_doctor(self, *, limit: int = 100) -> Dict[str, Any]:
+        if self._conn is None:
+            return {"ok": True, "findings": [], "counts": {"findings": 0}}
+        limit = _clamp_int(limit, 100, 1, 500)
+        findings: List[Dict[str, Any]] = []
+
+        def add(severity: str, code: str, kind: str, row_id: Any, detail: str) -> None:
+            if len(findings) >= limit:
+                return
+            try:
+                parsed_id = int(row_id)
+            except (TypeError, ValueError):
+                return
+            findings.append({
+                "severity": severity,
+                "code": code,
+                "ref": f"{kind}:{parsed_id}",
+                "kind": kind,
+                "id": parsed_id,
+                "detail": detail,
+            })
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, canonical_name FROM entities
+                WHERE superseded_at IS NULL
+                ORDER BY id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            for row in rows:
+                if self._looks_like_relationish_entity_name(row["canonical_name"] or ""):
+                    add(
+                        "warn",
+                        "malformed_entity_name",
+                        "entity",
+                        row["id"],
+                        "canonical_name looks relation-like",
+                    )
+
+            blank_checks = [
+                (
+                    "entity",
+                    "entities",
+                    "TRIM(COALESCE(canonical_name, '')) = '' OR TRIM(COALESCE(type, '')) = ''",
+                ),
+                (
+                    "fact",
+                    "facts",
+                    "TRIM(COALESCE(predicate, '')) = '' OR TRIM(COALESCE(object_value, '')) = ''",
+                ),
+                (
+                    "preference",
+                    "preferences",
+                    "TRIM(COALESCE(domain, '')) = '' OR TRIM(COALESCE(statement, '')) = '' "
+                    "OR TRIM(COALESCE(strength, '')) = ''",
+                ),
+                (
+                    "commitment",
+                    "commitments",
+                    "TRIM(COALESCE(description, '')) = '' OR TRIM(COALESCE(owner, '')) = '' "
+                    "OR TRIM(COALESCE(status, '')) = ''",
+                ),
+            ]
+            for kind, table, where in blank_checks:
+                if len(findings) >= limit:
+                    break
+                rows = self._conn.execute(
+                    f"SELECT id FROM {table} WHERE {where} ORDER BY id LIMIT ?",
+                    (limit - len(findings),),
+                ).fetchall()
+                for row in rows:
+                    add("error", "blank_summary", kind, row["id"], "required summary field is blank")
+
+            if len(findings) < limit:
+                rows = self._conn.execute(
+                    """
+                    SELECT r.id
+                    FROM relations r
+                    LEFT JOIN entities f ON f.id = r.from_entity_id
+                    LEFT JOIN entities t ON t.id = r.to_entity_id
+                    WHERE TRIM(COALESCE(r.relation, '')) = ''
+                       OR f.id IS NULL
+                       OR t.id IS NULL
+                    ORDER BY r.id
+                    LIMIT ?
+                    """,
+                    (limit - len(findings),),
+                ).fetchall()
+                for row in rows:
+                    add("error", "blank_summary", "relation", row["id"], "relation summary cannot be rendered")
+
+            superseded_checks = [
+                ("entity", "entities", "t.superseded_at IS NOT NULL"),
+                (
+                    "fact",
+                    "facts",
+                    "t.superseded_by_id IS NOT NULL OR t.superseded_at IS NOT NULL",
+                ),
+                (
+                    "preference",
+                    "preferences",
+                    "t.superseded_by_id IS NOT NULL OR t.superseded_at IS NOT NULL",
+                ),
+                (
+                    "commitment",
+                    "commitments",
+                    "t.superseded_by_id IS NOT NULL OR t.superseded_at IS NOT NULL",
+                ),
+                (
+                    "relation",
+                    "relations",
+                    "t.superseded_by_id IS NOT NULL OR t.superseded_at IS NOT NULL",
+                ),
+            ]
+            for kind, table, where in superseded_checks:
+                if len(findings) >= limit:
+                    break
+                rows = self._conn.execute(
+                    f"""
+                    SELECT m.row_id
+                    FROM memory_embedding_records m
+                    JOIN {table} t ON t.id = m.row_id
+                    WHERE m.kind = ?
+                      AND ({where})
+                      AND (
+                        m.embedding_vector IS NOT NULL
+                        OR TRIM(COALESCE(m.text, '')) != ''
+                      )
+                    ORDER BY m.row_id
+                    LIMIT ?
+                    """,
+                    (kind, limit - len(findings)),
+                ).fetchall()
+                for row in rows:
+                    add(
+                        "warn",
+                        "superseded_embedding",
+                        kind,
+                        row["row_id"],
+                        "superseded row still has embedding text/vector",
+                    )
+
+            tables = {
+                "entity": "entities",
+                "fact": "facts",
+                "preference": "preferences",
+                "commitment": "commitments",
+                "relation": "relations",
+            }
+            for kind, table in tables.items():
+                if len(findings) >= limit:
+                    break
+                rows = self._conn.execute(
+                    f"""
+                    SELECT m.row_id
+                    FROM memory_embedding_records m
+                    LEFT JOIN {table} t ON t.id = m.row_id
+                    WHERE m.kind = ? AND t.id IS NULL
+                    ORDER BY m.row_id
+                    LIMIT ?
+                    """,
+                    (kind, limit - len(findings)),
+                ).fetchall()
+                for row in rows:
+                    add("warn", "orphan_embedding", kind, row["row_id"], "embedding row has no memory record")
+
+            if len(findings) < limit:
+                rows = self._conn.execute(
+                    """
+                    SELECT kind, row_id, embedding_vector
+                    FROM memory_embedding_records
+                    WHERE embedding_vector IS NOT NULL
+                    ORDER BY kind, row_id
+                    LIMIT ?
+                    """,
+                    (limit - len(findings),),
+                ).fetchall()
+                for row in rows:
+                    if self._decode_embedding_vector(row["embedding_vector"]) is None:
+                        add(
+                            "error",
+                            "invalid_embedding",
+                            row["kind"],
+                            row["row_id"],
+                            "embedding vector is malformed",
+                        )
+
+        embedding_cfg = self._embedding_config()
+        if embedding_cfg.get("configured"):
+            for kind, row_id in self._active_memory_refs():
+                if len(findings) >= limit:
+                    break
+                with self._lock:
+                    row = self._conn.execute(
+                        """
+                        SELECT embedding_vector
+                        FROM memory_embedding_records
+                        WHERE kind = ? AND row_id = ?
+                        """,
+                        (kind, row_id),
+                    ).fetchone()
+                if row is None or not row["embedding_vector"]:
+                    add(
+                        "warn",
+                        "missing_embedding",
+                        kind,
+                        row_id,
+                        "active row has no embedding vector",
+                    )
+
+        return {
+            "ok": not findings,
+            "findings": findings,
+            "counts": {"findings": len(findings)},
+            "embeddings_configured": bool(embedding_cfg.get("configured")),
+            "truncated": len(findings) >= limit,
+        }
 
     def rebuild_embeddings(
         self,
