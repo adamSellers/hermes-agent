@@ -283,7 +283,8 @@ def cmd_search(args) -> None:
     provider = _provider()
     try:
         kinds = set(getattr(args, "kind", []) or [])
-        items = provider.search_memory(args.query, kinds=kinds, limit=args.limit)
+        tags = list(getattr(args, "tag", []) or [])
+        items = provider.search_memory(args.query, kinds=kinds, tags=tags, limit=args.limit)
         if getattr(args, "debug", False):
             _print_debug_items(items)
         else:
@@ -328,6 +329,7 @@ def cmd_remember(args) -> None:
                 "kind": args.kind,
                 "content": content,
                 "confidence": args.confidence,
+                "tags": list(getattr(args, "tag", []) or []),
             },
         )
         print(result)
@@ -550,6 +552,7 @@ def _add_commands(subs, *, set_func: bool) -> None:
     search = subs.add_parser("search", help="Search durable memories")
     search.add_argument("query")
     search.add_argument("--kind", action="append", choices=["entity", "fact", "preference", "commitment", "relation"])
+    search.add_argument("--tag", action="append", help="Filter by durable memory tag")
     search.add_argument("--limit", type=int, default=20)
     search.add_argument("--debug", action="store_true", help="Show recall source and score details")
 
@@ -561,6 +564,7 @@ def _add_commands(subs, *, set_func: bool) -> None:
     remember.add_argument("kind", choices=["entity", "fact", "preference", "commitment"])
     remember.add_argument("content", help='JSON content, e.g. {"subject":"user","predicate":"timezone","object":"AEST"}')
     remember.add_argument("--confidence", type=float, default=0.9)
+    remember.add_argument("--tag", action="append", help="Attach a durable memory tag")
 
     pin = subs.add_parser("pin", help="Pin a durable memory into the briefing")
     pin.add_argument("memory_ref")

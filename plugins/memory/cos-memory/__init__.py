@@ -94,6 +94,14 @@ RECALL_MEMORY_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string"},
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional durable-memory tags to filter by, such as "
+                    "shopping_list or shopping_list:groceries."
+                ),
+            },
             "kinds": {
                 "type": "array",
                 "items": {
@@ -104,7 +112,7 @@ RECALL_MEMORY_SCHEMA = {
                 "type": "integer",
                 "default": 8,
                 "minimum": 1,
-                "maximum": 20,
+                "maximum": 100,
             },
         },
         "required": ["query"],
@@ -132,6 +140,14 @@ REMEMBER_SCHEMA = {
                 ),
             },
             "confidence": {"type": "number", "default": 0.8},
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional durable-memory tags for skill-owned state and "
+                    "curation, such as shopping_list:groceries."
+                ),
+            },
         },
         "required": ["kind", "content"],
     },
@@ -262,6 +278,19 @@ CREATE TABLE IF NOT EXISTS memory_embedding_records (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_embedding_records_kind
     ON memory_embedding_records(kind, row_id);
+
+CREATE TABLE IF NOT EXISTS memory_tags (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    row_id INTEGER NOT NULL,
+    tag TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(kind, row_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_tags_tag
+    ON memory_tags(tag, kind, row_id);
+CREATE INDEX IF NOT EXISTS idx_memory_tags_ref
+    ON memory_tags(kind, row_id);
 
 CREATE TABLE IF NOT EXISTS entities (
     id INTEGER PRIMARY KEY,
@@ -445,6 +474,28 @@ def parse_memory_ref(memory_ref: str) -> Tuple[Optional[str], Optional[int]]:
     if kind not in {"entity", "fact", "preference", "commitment", "relation"}:
         return None, None
     return kind, row_id
+
+
+def _normalize_tags(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    values = [raw] if isinstance(raw, str) else raw
+    if not isinstance(values, list):
+        return []
+    tags: List[str] = []
+    seen = set()
+    for value in values:
+        tag = str(value or "").strip().lower()
+        if not tag:
+            continue
+        tag = re.sub(r"\s+", "_", tag)
+        tag = re.sub(r"[^a-z0-9:_-]+", "_", tag).strip("_")
+        tag = re.sub(r"_+", "_", tag)
+        tag = tag[:120]
+        if tag and tag not in seen:
+            seen.add(tag)
+            tags.append(tag)
+    return tags
 
 
 class CosMemoryProvider(MemoryProvider):
@@ -1656,8 +1707,10 @@ class CosMemoryProvider(MemoryProvider):
         source_turn_id: Optional[int],
         actor: str,
         user_edited: bool,
+        tags: Optional[List[str]] = None,
     ) -> Tuple[str, int]:
         kind = (kind or "").strip().lower()
+        record_tags = _normalize_tags(tags if tags is not None else payload.get("tags"))
         if kind == "entity":
             row_id = self._upsert_entity(
                 payload.get("type") or "thing",
@@ -1667,21 +1720,56 @@ class CosMemoryProvider(MemoryProvider):
                 actor=actor,
                 user_edited=user_edited,
             )
+            self._set_memory_tags("entity", row_id, record_tags)
             self._enqueue_memory_embedding("entity", row_id)
             return "entity", row_id
         if kind == "fact":
             row_id = self._create_fact(payload, confidence, source_session_id, source_turn_id, actor, user_edited)
+            self._set_memory_tags("fact", row_id, record_tags)
             self._enqueue_memory_embedding("fact", row_id)
             return "fact", row_id
         if kind == "preference":
             row_id = self._create_preference(payload, confidence, source_session_id, source_turn_id, actor, user_edited)
+            self._set_memory_tags("preference", row_id, record_tags)
             self._enqueue_memory_embedding("preference", row_id)
             return "preference", row_id
         if kind == "commitment":
             row_id = self._create_commitment(payload, confidence, source_session_id, source_turn_id, actor, user_edited)
+            self._set_memory_tags("commitment", row_id, record_tags)
             self._enqueue_memory_embedding("commitment", row_id)
             return "commitment", row_id
         raise ValueError(f"unsupported memory kind {kind!r}")
+
+    def _set_memory_tags(self, kind: str, row_id: int, tags: List[str]) -> None:
+        if self._conn is None or not tags:
+            return
+        now = _now()
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM memory_tags WHERE kind = ? AND row_id = ?",
+                (kind, row_id),
+            )
+            self._conn.executemany(
+                """
+                INSERT OR IGNORE INTO memory_tags(kind, row_id, tag, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                [(kind, row_id, tag, now) for tag in tags],
+            )
+
+    def _memory_tags(self, kind: str, row_id: int) -> List[str]:
+        if self._conn is None:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT tag FROM memory_tags
+                WHERE kind = ? AND row_id = ?
+                ORDER BY tag
+                """,
+                (kind, row_id),
+            ).fetchall()
+        return [str(row["tag"]) for row in rows]
 
     def _enqueue_memory_embedding(self, kind: str, row_id: int) -> None:
         if self._conn is None:
@@ -1827,6 +1915,10 @@ class CosMemoryProvider(MemoryProvider):
                 self._conn.execute(
                     "UPDATE facts SET superseded_by_id = ?, superseded_at = ? WHERE id = ?",
                     (row_id, now, old["id"]),
+                )
+                self._conn.execute(
+                    "DELETE FROM memory_embedding_records WHERE kind = 'fact' AND row_id = ?",
+                    (old["id"],),
                 )
             self._audit(actor, "create", "facts", row_id, payload)
             return row_id
@@ -2150,32 +2242,52 @@ class CosMemoryProvider(MemoryProvider):
 
     def _handle_recall_memory(self, args: Dict[str, Any]) -> str:
         query = str(args.get("query") or "").strip()
-        max_results = _clamp_int(args.get("max_results"), 8, 1, 20)
+        tags = _normalize_tags(args.get("tags"))
+        max_results = _clamp_int(args.get("max_results"), 8, 1, 100)
         kinds = args.get("kinds") or []
         if isinstance(kinds, str):
             kinds = [kinds]
         allowed = {str(k).strip().lower() for k in kinds if k}
-        if not query:
+        if not query and not tags:
             return "No query provided."
-        rows = self.search_memory(query, kinds=allowed, limit=max_results)
+        rows = self.search_memory(query, kinds=allowed, tags=tags, limit=max_results)
         if not rows:
             return "No durable memory results."
         lines = []
         for item in rows:
+            tag_line = ""
+            if item.get("tags"):
+                tag_line = f"  tags: {', '.join(item['tags'])}\n"
             lines.append(
                 f"- ref: {item['ref']}\n"
                 f"  kind: {item['kind']}\n"
                 f"  summary: {item['summary']}\n"
+                f"{tag_line}"
                 f"  score: {item['score']:.2f}"
             )
         return "\n".join(lines)
 
-    def search_memory(self, query: str, *, kinds: Optional[set] = None, limit: int = 20) -> List[Dict[str, Any]]:
-        lexical = self._search_memory_lexical(query, kinds=kinds, limit=max(limit * 2, limit))
+    def search_memory(
+        self,
+        query: str,
+        *,
+        kinds: Optional[set] = None,
+        tags: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        tags = _normalize_tags(tags)
+        search_limit = max(limit * 2, limit)
+        if tags:
+            lexical = self._search_memory_lexical(query, kinds=kinds, tags=tags, limit=search_limit)
+        else:
+            lexical = self._search_memory_lexical(query, kinds=kinds, limit=search_limit)
         for item in lexical:
             item.setdefault("source", "fts")
             item.setdefault("lexical_score", float(item.get("score") or 0.0))
-        vector = self._search_memory_vector(query, kinds=kinds, limit=max(limit * 2, limit))
+        if tags:
+            vector = self._search_memory_vector(query, kinds=kinds, tags=tags, limit=search_limit)
+        else:
+            vector = self._search_memory_vector(query, kinds=kinds, limit=search_limit)
         if not vector:
             return lexical[:limit]
         merged: Dict[str, Dict[str, Any]] = {}
@@ -2211,81 +2323,166 @@ class CosMemoryProvider(MemoryProvider):
         )
         return results[:limit]
 
-    def _search_memory_lexical(self, query: str, *, kinds: Optional[set] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    def _tag_filter_clause(self, kind: str, row_expr: str, tags: List[str]) -> Tuple[str, List[Any]]:
+        if not tags:
+            return "", []
+        placeholders = ",".join("?" for _ in tags)
+        return (
+            f"""
+              AND (
+                SELECT COUNT(DISTINCT mt.tag)
+                FROM memory_tags mt
+                WHERE mt.kind = ?
+                  AND mt.row_id = {row_expr}
+                  AND mt.tag IN ({placeholders})
+              ) = ?
+            """,
+            [kind, *tags, len(tags)],
+        )
+
+    def _search_memory_lexical(
+        self,
+        query: str,
+        *,
+        kinds: Optional[set] = None,
+        tags: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
         if self._conn is None:
             return []
-        needle = f"%{query.lower()}%"
+        tags = _normalize_tags(tags)
+        needle = f"%{query.lower()}%" if query else "%%"
         kinds = kinds or set()
         results: List[Dict[str, Any]] = []
         with self._lock:
             if not kinds or "entity" in kinds:
+                tag_sql, tag_params = self._tag_filter_clause("entity", "entities.id", tags)
                 rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT id, type, canonical_name, notes FROM entities
                     WHERE superseded_at IS NULL
                       AND (lower(canonical_name) LIKE ? OR lower(COALESCE(notes, '')) LIKE ?)
+                      {tag_sql}
                     ORDER BY pinned DESC, salience DESC, last_seen DESC LIMIT ?
                     """,
-                    (needle, needle, limit),
+                    (needle, needle, *tag_params, limit),
                 ).fetchall()
                 for r in rows:
-                    results.append({"kind": "entity", "id": r["id"], "ref": f"entity:{r['id']}", "score": 0.8, "summary": f"{r['canonical_name']} ({r['type']})"})
+                    results.append({
+                        "kind": "entity",
+                        "id": r["id"],
+                        "ref": f"entity:{r['id']}",
+                        "score": 0.8,
+                        "summary": f"{r['canonical_name']} ({r['type']})",
+                        "tags": self._memory_tags("entity", int(r["id"])),
+                    })
             if not kinds or "fact" in kinds:
+                tag_sql, tag_params = self._tag_filter_clause("fact", "f.id", tags)
                 rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT f.id, e.canonical_name AS subject, f.predicate, f.object_value
                     FROM facts f LEFT JOIN entities e ON e.id = f.subject_entity_id
                     WHERE f.superseded_by_id IS NULL
                       AND f.superseded_at IS NULL
                       AND lower(COALESCE(e.canonical_name, '') || ' ' || f.predicate || ' ' || COALESCE(f.object_value, '')) LIKE ?
+                      {tag_sql}
                     ORDER BY f.pinned DESC, f.last_confirmed_at DESC LIMIT ?
                     """,
-                    (needle, limit),
+                    (needle, *tag_params, limit),
                 ).fetchall()
                 for r in rows:
-                    results.append({"kind": "fact", "id": r["id"], "ref": f"fact:{r['id']}", "score": 0.75, "summary": f"{r['subject'] or 'user'} {r['predicate']} {r['object_value']}"})
+                    results.append({
+                        "kind": "fact",
+                        "id": r["id"],
+                        "ref": f"fact:{r['id']}",
+                        "score": 0.75,
+                        "summary": f"{r['subject'] or 'user'} {r['predicate']} {r['object_value']}",
+                        "tags": self._memory_tags("fact", int(r["id"])),
+                    })
             if not kinds or "preference" in kinds:
+                tag_sql, tag_params = self._tag_filter_clause("preference", "preferences.id", tags)
                 rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT id, domain, statement, strength FROM preferences
                     WHERE superseded_by_id IS NULL
                       AND superseded_at IS NULL
                       AND lower(domain || ' ' || statement || ' ' || strength) LIKE ?
+                      {tag_sql}
                     ORDER BY pinned DESC, last_confirmed_at DESC LIMIT ?
                     """,
-                    (needle, limit),
+                    (needle, *tag_params, limit),
                 ).fetchall()
                 for r in rows:
-                    results.append({"kind": "preference", "id": r["id"], "ref": f"preference:{r['id']}", "score": 0.72, "summary": f"[{r['domain']}/{r['strength']}] {r['statement']}"})
+                    results.append({
+                        "kind": "preference",
+                        "id": r["id"],
+                        "ref": f"preference:{r['id']}",
+                        "score": 0.72,
+                        "summary": f"[{r['domain']}/{r['strength']}] {r['statement']}",
+                        "tags": self._memory_tags("preference", int(r["id"])),
+                    })
             if not kinds or "commitment" in kinds:
+                tag_sql, tag_params = self._tag_filter_clause("commitment", "commitments.id", tags)
                 rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT id, description, owner, status, due_at FROM commitments
                     WHERE superseded_by_id IS NULL
                       AND superseded_at IS NULL
                       AND lower(description || ' ' || owner || ' ' || status) LIKE ?
+                      {tag_sql}
                     ORDER BY status = 'open' DESC, due_at IS NULL, due_at ASC, last_confirmed_at DESC LIMIT ?
                     """,
-                    (needle, limit),
+                    (needle, *tag_params, limit),
                 ).fetchall()
                 for r in rows:
-                    results.append({"kind": "commitment", "id": r["id"], "ref": f"commitment:{r['id']}", "score": 0.7, "summary": f"[{r['status']}/{r['owner']}] {r['description']}"})
+                    results.append({
+                        "kind": "commitment",
+                        "id": r["id"],
+                        "ref": f"commitment:{r['id']}",
+                        "score": 0.7,
+                        "summary": f"[{r['status']}/{r['owner']}] {r['description']}",
+                        "tags": self._memory_tags("commitment", int(r["id"])),
+                    })
         return results[:limit]
 
-    def _search_memory_vector(self, query: str, *, kinds: Optional[set] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    def _search_memory_vector(
+        self,
+        query: str,
+        *,
+        kinds: Optional[set] = None,
+        tags: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
         if self._conn is None:
             return []
+        if not query:
+            return []
+        tags = _normalize_tags(tags)
         kinds = kinds or set()
-        filters = ["embedding_vector IS NOT NULL"]
+        filters = ["m.embedding_vector IS NOT NULL"]
         params: List[Any] = []
         if kinds:
             placeholders = ",".join("?" for _ in kinds)
-            filters.append(f"kind IN ({placeholders})")
+            filters.append(f"m.kind IN ({placeholders})")
             params.extend(sorted(kinds))
+        if tags:
+            placeholders = ",".join("?" for _ in tags)
+            filters.append(
+                f"""
+                (
+                    SELECT COUNT(DISTINCT mt.tag)
+                    FROM memory_tags mt
+                    WHERE mt.kind = m.kind
+                      AND mt.row_id = m.row_id
+                      AND mt.tag IN ({placeholders})
+                ) = ?
+                """
+            )
+            params.extend([*tags, len(tags)])
         where = " AND ".join(filters)
         with self._lock:
             has_vectors = self._conn.execute(
-                f"SELECT 1 FROM memory_embedding_records WHERE {where} LIMIT 1",
+                f"SELECT 1 FROM memory_embedding_records m WHERE {where} LIMIT 1",
                 tuple(params),
             ).fetchone()
         if not has_vectors:
@@ -2300,8 +2497,8 @@ class CosMemoryProvider(MemoryProvider):
         with self._lock:
             rows = self._conn.execute(
                 f"""
-                SELECT kind, row_id, embedding_vector
-                FROM memory_embedding_records
+                SELECT m.kind, m.row_id, m.embedding_vector
+                FROM memory_embedding_records m
                 WHERE {where}
                 """,
                 tuple(params),
@@ -2327,6 +2524,7 @@ class CosMemoryProvider(MemoryProvider):
         if self._conn is None:
             return None
         kind = (kind or "").strip().lower()
+        tags_text = " ".join(self._memory_tags(kind, row_id))
         with self._lock:
             if kind == "entity":
                 row = self._conn.execute(
@@ -2344,6 +2542,7 @@ class CosMemoryProvider(MemoryProvider):
                         "score": 0.0,
                         "summary": f"{row['canonical_name']} ({row['type']})"
                         + (f" - {row['notes']}" if row["notes"] else ""),
+                        "tags": self._memory_tags("entity", int(row["id"])),
                     }
             if kind == "fact":
                 row = self._conn.execute(
@@ -2361,6 +2560,7 @@ class CosMemoryProvider(MemoryProvider):
                         "ref": f"fact:{row['id']}",
                         "score": 0.0,
                         "summary": f"{row['subject'] or 'user'} {row['predicate']} {row['object_value']}",
+                        "tags": self._memory_tags("fact", int(row["id"])),
                     }
             if kind == "preference":
                 row = self._conn.execute(
@@ -2378,6 +2578,7 @@ class CosMemoryProvider(MemoryProvider):
                         "ref": f"preference:{row['id']}",
                         "score": 0.0,
                         "summary": f"[{row['domain']}/{row['strength']}] {row['statement']}",
+                        "tags": self._memory_tags("preference", int(row["id"])),
                     }
             if kind == "commitment":
                 row = self._conn.execute(
@@ -2396,6 +2597,7 @@ class CosMemoryProvider(MemoryProvider):
                         "ref": f"commitment:{row['id']}",
                         "score": 0.0,
                         "summary": f"[{row['status']}/{row['owner']}]{due} {row['description']}",
+                        "tags": self._memory_tags("commitment", int(row["id"])),
                     }
             if kind == "relation":
                 row = self._conn.execute(
@@ -2416,6 +2618,7 @@ class CosMemoryProvider(MemoryProvider):
                         "ref": f"relation:{row['id']}",
                         "score": 0.0,
                         "summary": f"{row['from_name']} {row['relation']} {row['to_name']}",
+                        "tags": self._memory_tags("relation", int(row["id"])),
                     }
         return None
 
@@ -2423,6 +2626,7 @@ class CosMemoryProvider(MemoryProvider):
         if self._conn is None:
             return None
         kind = (kind or "").strip().lower()
+        tags_text = " ".join(self._memory_tags(kind, row_id))
         with self._lock:
             if kind == "entity":
                 row = self._conn.execute(
@@ -2440,6 +2644,7 @@ class CosMemoryProvider(MemoryProvider):
                             row["aliases"] or "",
                             row["attributes"] or "",
                             row["notes"] or "",
+                            tags_text,
                         )
                         if part
                     )
@@ -2453,7 +2658,16 @@ class CosMemoryProvider(MemoryProvider):
                     (row_id,),
                 ).fetchone()
                 if row:
-                    return f"fact {row['subject'] or 'user'} {row['predicate']} {row['object_value']}"
+                    return " ".join(
+                        part for part in (
+                            "fact",
+                            row["subject"] or "user",
+                            row["predicate"],
+                            row["object_value"],
+                            tags_text,
+                        )
+                        if part
+                    )
             if kind == "preference":
                 row = self._conn.execute(
                     """
@@ -2463,7 +2677,16 @@ class CosMemoryProvider(MemoryProvider):
                     (row_id,),
                 ).fetchone()
                 if row:
-                    return f"preference {row['domain']} {row['strength']} {row['statement']}"
+                    return " ".join(
+                        part for part in (
+                            "preference",
+                            row["domain"],
+                            row["strength"],
+                            row["statement"],
+                            tags_text,
+                        )
+                        if part
+                    )
             if kind == "commitment":
                 row = self._conn.execute(
                     """
@@ -2474,7 +2697,15 @@ class CosMemoryProvider(MemoryProvider):
                 ).fetchone()
                 if row:
                     due = f" due {row['due_at']}" if row["due_at"] else ""
-                    return f"commitment {row['status']} owner {row['owner']}{due} {row['description']}"
+                    return " ".join(
+                        part for part in (
+                            f"commitment {row['status']}",
+                            f"owner {row['owner']}{due}",
+                            row["description"],
+                            tags_text,
+                        )
+                        if part
+                    )
             if kind == "relation":
                 row = self._conn.execute(
                     """
@@ -2488,7 +2719,16 @@ class CosMemoryProvider(MemoryProvider):
                     (row_id,),
                 ).fetchone()
                 if row:
-                    return f"relation {row['from_name']} {row['relation']} {row['to_name']}"
+                    return " ".join(
+                        part for part in (
+                            "relation",
+                            row["from_name"],
+                            row["relation"],
+                            row["to_name"],
+                            tags_text,
+                        )
+                        if part
+                    )
         return None
 
     def list_memory(
@@ -2964,6 +3204,8 @@ class CosMemoryProvider(MemoryProvider):
         if not cfg.get("configured"):
             result["error"] = "memory_embedding endpoint is not configured"
             return result
+        if include_memory:
+            result["pruned_inactive_memory_records"] = self._prune_inactive_memory_embeddings()
         remaining = max(0, int(limit or 0))
         if include_sessions:
             with self._lock:
@@ -3018,6 +3260,82 @@ class CosMemoryProvider(MemoryProvider):
                     result["errors"].append(f"{kind}:{row_id} {str(exc)[:240]}")
         return result
 
+    def _prune_inactive_memory_embeddings(self) -> int:
+        if self._conn is None:
+            return 0
+        deletes = [
+            (
+                "entity",
+                """
+                DELETE FROM memory_embedding_records
+                WHERE kind = 'entity'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM entities e
+                    WHERE e.id = memory_embedding_records.row_id
+                      AND e.superseded_at IS NULL
+                  )
+                """,
+            ),
+            (
+                "fact",
+                """
+                DELETE FROM memory_embedding_records
+                WHERE kind = 'fact'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM facts f
+                    WHERE f.id = memory_embedding_records.row_id
+                      AND f.superseded_by_id IS NULL
+                      AND f.superseded_at IS NULL
+                  )
+                """,
+            ),
+            (
+                "preference",
+                """
+                DELETE FROM memory_embedding_records
+                WHERE kind = 'preference'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM preferences p
+                    WHERE p.id = memory_embedding_records.row_id
+                      AND p.superseded_by_id IS NULL
+                      AND p.superseded_at IS NULL
+                  )
+                """,
+            ),
+            (
+                "commitment",
+                """
+                DELETE FROM memory_embedding_records
+                WHERE kind = 'commitment'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM commitments c
+                    WHERE c.id = memory_embedding_records.row_id
+                      AND c.superseded_by_id IS NULL
+                      AND c.superseded_at IS NULL
+                  )
+                """,
+            ),
+            (
+                "relation",
+                """
+                DELETE FROM memory_embedding_records
+                WHERE kind = 'relation'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM relations r
+                    WHERE r.id = memory_embedding_records.row_id
+                      AND r.superseded_by_id IS NULL
+                      AND r.superseded_at IS NULL
+                  )
+                """,
+            ),
+        ]
+        pruned = 0
+        with self._lock:
+            for _kind, sql in deletes:
+                cur = self._conn.execute(sql)
+                pruned += int(cur.rowcount or 0)
+        return pruned
+
     def _active_memory_refs(self, *, limit: int = 0) -> List[Tuple[str, int]]:
         if self._conn is None:
             return []
@@ -3068,7 +3386,7 @@ class CosMemoryProvider(MemoryProvider):
     def export_memory(self) -> Dict[str, Any]:
         if self._conn is None:
             return {}
-        tables = ("entities", "facts", "preferences", "commitments", "relations")
+        tables = ("entities", "facts", "preferences", "commitments", "relations", "memory_tags")
         payload: Dict[str, Any] = {
             "format": "cos-memory-export-v1",
             "exported_at": _now(),
@@ -3086,7 +3404,7 @@ class CosMemoryProvider(MemoryProvider):
             return {}
         if not isinstance(payload, dict) or payload.get("format") != "cos-memory-export-v1":
             raise ValueError("unsupported cos-memory export format")
-        tables = ("entities", "facts", "preferences", "commitments", "relations")
+        tables = ("entities", "facts", "preferences", "commitments", "relations", "memory_tags")
         counts: Dict[str, int] = {}
         with self._lock:
             for table in tables:
@@ -3121,6 +3439,7 @@ class CosMemoryProvider(MemoryProvider):
         content = args.get("content") or {}
         if not isinstance(content, dict):
             return tool_error("remember content must be an object")
+        tags = _normalize_tags(args.get("tags") or content.get("tags"))
         try:
             confidence = float(args.get("confidence", 0.8))
         except (TypeError, ValueError):
@@ -3134,11 +3453,18 @@ class CosMemoryProvider(MemoryProvider):
                 source_turn_id=None,
                 actor="agent",
                 user_edited=False,
+                tags=tags,
             )
         except Exception as exc:
             return tool_error(f"remember failed: {exc}")
         self._briefing_cache = ""
-        return json.dumps({"ok": True, "ref": f"{item_kind}:{row_id}", "kind": item_kind, "id": row_id})
+        return json.dumps({
+            "ok": True,
+            "ref": f"{item_kind}:{row_id}",
+            "kind": item_kind,
+            "id": row_id,
+            "tags": tags,
+        })
 
     def _handle_forget(self, args: Dict[str, Any]) -> str:
         kind, row_id = parse_memory_ref(str(args.get("memory_ref") or ""))
@@ -3209,6 +3535,10 @@ class CosMemoryProvider(MemoryProvider):
             if cur.rowcount:
                 self._conn.execute(
                     "DELETE FROM memory_embedding_records WHERE kind = ? AND row_id = ?",
+                    (kind, row_id),
+                )
+                self._conn.execute(
+                    "DELETE FROM memory_tags WHERE kind = ? AND row_id = ?",
                     (kind, row_id),
                 )
                 self._audit(actor, "delete", table, row_id, {"redacted": True, "reason": reason})

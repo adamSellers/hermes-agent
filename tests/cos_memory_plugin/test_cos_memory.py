@@ -445,6 +445,130 @@ def test_remember_recall_and_forget_fact(tmp_path):
     provider.shutdown()
 
 
+def test_remember_tags_support_skill_owned_state(tmp_path):
+    provider = _provider_without_workers(tmp_path, session_id="s1")
+
+    remembered = json.loads(
+        provider.handle_tool_call(
+            "remember",
+            {
+                "kind": "fact",
+                "content": {
+                    "subject": "shopping_list:groceries:dried_chick_peas",
+                    "subject_type": "thing",
+                    "predicate": "shopping_item_status",
+                    "object": "status=pending item=dried chick peas list=groceries",
+                },
+                "tags": ["shopping_list", "shopping_list:groceries", "status:pending"],
+            },
+        )
+    )
+    provider.handle_tool_call(
+        "remember",
+        {
+            "kind": "fact",
+            "content": {
+                "subject": "shopping_list:hardware:screws",
+                "subject_type": "thing",
+                "predicate": "shopping_item_status",
+                "object": "status=pending item=screws list=hardware",
+            },
+            "tags": ["shopping_list", "shopping_list:hardware", "status:pending"],
+        },
+    )
+
+    recalled = provider.handle_tool_call(
+        "recall_memory",
+        {
+            "query": "pending",
+            "tags": ["shopping_list:groceries", "status:pending"],
+            "kinds": ["fact"],
+            "max_results": 100,
+        },
+    )
+    tag_only = provider.search_memory(
+        "",
+        kinds={"fact"},
+        tags=["shopping_list:groceries"],
+        limit=100,
+    )
+    provider.shutdown()
+
+    assert remembered["tags"] == ["shopping_list", "shopping_list:groceries", "status:pending"]
+    assert "dried chick peas" in recalled
+    assert "screws" not in recalled
+    assert [row["ref"] for row in tag_only] == [remembered["ref"]]
+    assert tag_only[0]["tags"] == ["shopping_list", "shopping_list:groceries", "status:pending"]
+
+
+def test_tagged_fact_update_moves_item_between_status_tags(tmp_path):
+    provider = _provider_without_workers(tmp_path, session_id="s1")
+    content = {
+        "subject": "shopping_list:groceries:dried_chick_peas",
+        "subject_type": "thing",
+        "predicate": "shopping_item_status",
+        "object": "status=pending item=dried chick peas list=groceries",
+    }
+    pending = json.loads(
+        provider.handle_tool_call(
+            "remember",
+            {
+                "kind": "fact",
+                "content": content,
+                "tags": ["shopping_list", "shopping_list:groceries", "status:pending"],
+            },
+        )
+    )
+    pending_id = int(pending["ref"].split(":", 1)[1])
+    assert provider._conn is not None
+    with provider._lock:
+        provider._conn.execute(
+            """
+            INSERT INTO memory_embedding_records(
+                kind, row_id, text, embedding_model, embedding_vector,
+                embedded_at, created_at, updated_at
+            ) VALUES ('fact', ?, 'old pending shopping item', 'test-embed', '[1.0,0.0]', 1, 1, 1)
+            """,
+            (pending_id,),
+        )
+    bought_content = dict(content)
+    bought_content["object"] = "status=bought item=dried chick peas list=groceries"
+    bought = json.loads(
+        provider.handle_tool_call(
+            "remember",
+            {
+                "kind": "fact",
+                "content": bought_content,
+                "tags": ["shopping_list", "shopping_list:groceries", "status:bought"],
+            },
+        )
+    )
+
+    pending_rows = provider.search_memory(
+        "",
+        kinds={"fact"},
+        tags=["shopping_list:groceries", "status:pending"],
+        limit=100,
+    )
+    bought_rows = provider.search_memory(
+        "",
+        kinds={"fact"},
+        tags=["shopping_list:groceries", "status:bought"],
+        limit=100,
+    )
+    old_embedding = provider._conn.execute(
+        "SELECT 1 FROM memory_embedding_records WHERE kind = 'fact' AND row_id = ?",
+        (pending_id,),
+    ).fetchone()
+    provider.shutdown()
+
+    assert pending["ref"] != bought["ref"]
+    assert pending_rows == []
+    assert [row["ref"] for row in bought_rows] == [bought["ref"]]
+    assert "status=bought" in bought_rows[0]["summary"]
+    assert old_embedding is None
+
+
 def test_forget_entity_hides_it_from_normal_search(tmp_path):
     provider = _provider(tmp_path, session_id="s1")
     remembered = json.loads(

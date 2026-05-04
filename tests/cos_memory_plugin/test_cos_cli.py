@@ -282,6 +282,44 @@ def test_cli_search_debug_prints_sources_and_scores(tmp_path, monkeypatch, capsy
     assert "semantic=-" in out
 
 
+def test_cli_remember_and_search_support_tags(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "memory:\n  provider: cos-memory\n",
+        encoding="utf-8",
+    )
+
+    parser = _memory_parser()
+    content = json.dumps(
+        {
+            "subject": "shopping_list:groceries:dried_chick_peas",
+            "subject_type": "thing",
+            "predicate": "shopping_item_status",
+            "object": "status=pending item=dried chick peas list=groceries",
+        }
+    )
+    args = parser.parse_args(
+        [
+            "remember",
+            "fact",
+            content,
+            "--tag",
+            "shopping_list",
+            "--tag",
+            "shopping_list:groceries",
+        ]
+    )
+    args.func(args)
+    remembered = json.loads(capsys.readouterr().out)
+
+    args = parser.parse_args(["search", "pending", "--tag", "shopping_list:groceries"])
+    args.func(args)
+
+    out = capsys.readouterr().out
+    assert remembered["ref"] in out
+    assert "dried chick peas" in out
+
+
 def test_cli_doctor_reports_malformed_memory_json(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
