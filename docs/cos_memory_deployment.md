@@ -29,19 +29,25 @@ and context engine at startup.
 ```bash
 hermes memory status
 hermes memory stats --json
+hermes memory queue --json
+hermes memory doctor --json
 ```
 
 When `memory.provider` is `cos-memory`, these provider commands are available:
 
 ```bash
 hermes memory list
+hermes memory show fact:123
 hermes memory search "project name"
 hermes memory commitments
 hermes memory briefing
 hermes memory review
 hermes memory consolidate
+hermes memory queue --json
+hermes memory doctor --json
 hermes memory rebuild-vectors
 hermes memory export --out cos-memory-export.json
+hermes memory import --in cos-memory-export.json
 ```
 
 The active provider also exposes a top-level convenience command:
@@ -68,15 +74,33 @@ hermes cos-memory stats
   curation tools.
 - `cos-context` keeps recent hot turns verbatim, digests warm turns, and drops
   cold turns from live context once they are represented in compressed history.
+- Tool-router mode can keep the model-visible tool surface small while still
+  allowing the hidden memory tools and skills to be discovered and executed.
+- Private memory-backed skills currently include `shopping-list` and
+  `x-account`; they are deployed by the wrapper repo sync script.
 
 ## Current MVP Boundaries
 
-- The v1 provider is SQLite-only. There is no separate vector index to rebuild.
-  Embeddings are stored as JSON vectors inside `cos-memory.db`.
+- The v1 provider is SQLite-only. There is no external vector service.
+  Embeddings are stored as JSON vectors inside `cos-memory.db` and can be
+  rebuilt with `hermes memory rebuild-vectors`.
 - Automatic extraction uses the configured local auxiliary LLM for structured
   extraction. Deterministic rules are retained only as a fallback.
 - Sensitive-looking values are not stored by heuristic extraction unless the
   user explicitly asks Hermes to remember them.
+
+## Wrapper Repo Deploy
+
+From the Mac Studio wrapper repo:
+
+```bash
+./scripts/deploy_cos_memory_to_bot.sh --test
+./scripts/smoke_cos_memory_on_bot.sh
+```
+
+The deploy script syncs the selected Hermes memory/context/router paths and
+private skills to `~/.hermes/hermes-agent` on `oakley@bot.oakroad`. Restart the
+gateway only after code sync, activation, and smoke checks are complete.
 
 ## Local LLM Extraction
 

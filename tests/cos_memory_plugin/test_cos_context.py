@@ -55,6 +55,43 @@ def test_preflight_and_manual_checks_use_hot_zone_boundary():
     assert engine.has_content_to_compress(_conversation(11)) is True
 
 
+def test_preflight_uses_token_threshold_for_short_fat_sessions():
+    engine = load_context_engine("cos-context")
+    engine.threshold_tokens = 100
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "read the log"},
+        {"role": "assistant", "content": "", "tool_calls": []},
+        {"role": "tool", "content": "x" * 1000, "tool_call_id": "call_1"},
+    ]
+
+    assert engine.should_compress_preflight(messages) is True
+
+
+def test_compress_compacts_large_hot_tool_output_without_warm_turns():
+    engine = load_context_engine("cos-context")
+    engine.threshold_tokens = 100
+    engine.hot_tool_max_chars = 100
+    engine.hot_tool_head_chars = 30
+    engine.hot_tool_tail_chars = 20
+    large_output = "A" * 500 + "TAIL_MARKER"
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "inspect this"},
+        {"role": "assistant", "content": "", "tool_calls": []},
+        {"role": "tool", "content": large_output, "tool_call_id": "call_1"},
+    ]
+
+    compressed = engine.compress(messages, current_tokens=1000)
+
+    assert len(compressed) == len(messages)
+    assert "[Large tool output compacted by cos-context]" in compressed[-1]["content"]
+    assert "TAIL_MARKER" in compressed[-1]["content"]
+    assert len(compressed[-1]["content"]) < len(large_output)
+    assert engine.hot_tool_compactions_count == 1
+    assert engine.compression_count == 1
+
+
 def test_existing_digest_block_is_preserved_and_capped():
     engine = load_context_engine("cos-context")
     existing_entries = "\n\n".join(

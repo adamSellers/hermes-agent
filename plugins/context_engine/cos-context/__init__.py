@@ -14,6 +14,7 @@ path later without blocking a user-facing turn.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any, Dict, List, Tuple
@@ -23,6 +24,40 @@ from agent.context_engine import ContextEngine
 
 MARKER = "[COMPRESSED CONVERSATION HISTORY"
 END_MARKER = "[END COMPRESSED CONVERSATION HISTORY]"
+DEFAULT_THRESHOLD_TOKENS = 24000
+DEFAULT_THRESHOLD_PERCENT = 0.10
+DEFAULT_HOT_TOOL_MAX_CHARS = 6000
+DEFAULT_HOT_TOOL_HEAD_CHARS = 3500
+DEFAULT_HOT_TOOL_TAIL_CHARS = 1000
+
+
+def _coerce_int(value: Any, default: int, *, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= minimum else default
+
+
+def _coerce_float(value: Any, default: float, *, minimum: float = 0.01, maximum: float = 1.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _load_cos_context_settings() -> Dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    context_cfg = cfg.get("context") if isinstance(cfg, dict) else {}
+    if not isinstance(context_cfg, dict):
+        context_cfg = {}
+    settings = context_cfg.get("cos_context") or context_cfg.get("cos-context") or {}
+    return settings if isinstance(settings, dict) else {}
 
 
 class CosContextEngine(ContextEngine):
@@ -30,18 +65,48 @@ class CosContextEngine(ContextEngine):
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
-        self.threshold_tokens = 40000
+        settings = _load_cos_context_settings()
+        self.threshold_ceiling_tokens = _coerce_int(
+            os.getenv("HERMES_COS_CONTEXT_THRESHOLD_TOKENS")
+            or settings.get("threshold_tokens"),
+            DEFAULT_THRESHOLD_TOKENS,
+            minimum=4000,
+        )
+        self.threshold_tokens = self.threshold_ceiling_tokens
         self.context_length = 256000
         self.compression_count = 0
-        self.threshold_percent = 0.16
+        self.threshold_percent = _coerce_float(
+            os.getenv("HERMES_COS_CONTEXT_THRESHOLD")
+            or settings.get("threshold"),
+            DEFAULT_THRESHOLD_PERCENT,
+            minimum=0.02,
+            maximum=0.50,
+        )
         self.protect_first_n = 1
         self.protect_last_n = 20
-        self.hot_zone_turns = 10
-        self.warm_zone_turns = 20
-        self.digest_max_tokens = 250
+        self.hot_zone_turns = _coerce_int(settings.get("hot_zone_turns"), 10)
+        self.warm_zone_turns = _coerce_int(settings.get("warm_zone_turns"), 20)
+        self.digest_max_tokens = _coerce_int(settings.get("digest_max_tokens"), 250)
+        self.hot_tool_max_chars = _coerce_int(
+            os.getenv("HERMES_COS_CONTEXT_HOT_TOOL_MAX_CHARS")
+            or settings.get("hot_tool_max_chars"),
+            DEFAULT_HOT_TOOL_MAX_CHARS,
+            minimum=1000,
+        )
+        self.hot_tool_head_chars = _coerce_int(
+            settings.get("hot_tool_head_chars"),
+            DEFAULT_HOT_TOOL_HEAD_CHARS,
+            minimum=500,
+        )
+        self.hot_tool_tail_chars = _coerce_int(
+            settings.get("hot_tool_tail_chars"),
+            DEFAULT_HOT_TOOL_TAIL_CHARS,
+            minimum=0,
+        )
         self.hot_zone_turns_current = 0
         self.warm_zone_turns_current = 0
         self.cold_zone_turns_total = 0
+        self.hot_tool_compactions_count = 0
         self.last_digest_latency_ms = 0
         self.digest_failures_count = 0
         self.sync_digest_fallbacks_count = 0
@@ -60,7 +125,10 @@ class CosContextEngine(ContextEngine):
         provider: str = "",
     ) -> None:
         self.context_length = context_length or self.context_length
-        self.threshold_tokens = min(40000, int(self.context_length * self.threshold_percent))
+        self.threshold_tokens = min(
+            self.threshold_ceiling_tokens,
+            int(self.context_length * self.threshold_percent),
+        )
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         self.last_prompt_tokens = int(usage.get("prompt_tokens") or 0)
@@ -90,9 +158,20 @@ class CosContextEngine(ContextEngine):
     ) -> List[Dict[str, Any]]:
         self._last_messages = messages
         start = time.time()
+        messages, hot_tool_compactions = self._compact_hot_tool_outputs_if_needed(
+            messages,
+            current_tokens=current_tokens,
+        )
         system_messages, existing_digest_entries, body = self._split_messages(messages)
         turns = self._group_turns(body)
         if len(turns) <= self.hot_zone_turns:
+            if hot_tool_compactions:
+                self.hot_zone_turns_current = len(turns)
+                self.warm_zone_turns_current = len(existing_digest_entries)
+                self.hot_tool_compactions_count += hot_tool_compactions
+                self.last_digest_latency_ms = int((time.time() - start) * 1000)
+                self.compression_count += 1
+                return messages
             return messages
 
         warm_candidates = turns[:-self.hot_zone_turns]
@@ -112,9 +191,53 @@ class CosContextEngine(ContextEngine):
 
         self.hot_zone_turns_current = len(hot_turns)
         self.warm_zone_turns_current = len(all_entries)
+        self.hot_tool_compactions_count += hot_tool_compactions
         self.last_digest_latency_ms = int((time.time() - start) * 1000)
         self.compression_count += 1
         return new_messages
+
+    def _compact_hot_tool_outputs_if_needed(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        estimated = int(current_tokens or self._estimate_tokens(messages))
+        if estimated < self.threshold_tokens:
+            return messages, 0
+
+        compacted: List[Dict[str, Any]] = []
+        count = 0
+        for msg in messages:
+            if msg.get("role") != "tool":
+                compacted.append(msg)
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or len(content) <= self.hot_tool_max_chars:
+                compacted.append(msg)
+                continue
+            updated = dict(msg)
+            updated["content"] = self._compact_tool_text(content)
+            compacted.append(updated)
+            count += 1
+        return compacted, count
+
+    def _compact_tool_text(self, text: str) -> str:
+        head = text[: self.hot_tool_head_chars].rstrip()
+        tail = ""
+        if self.hot_tool_tail_chars:
+            tail = text[-self.hot_tool_tail_chars :].lstrip()
+        omitted = max(0, len(text) - len(head) - len(tail))
+        parts = [
+            "[Large tool output compacted by cos-context]",
+            f"Original size: {len(text):,} characters.",
+            f"Omitted middle: {omitted:,} characters.",
+            "",
+            "BEGIN PRESERVED HEAD",
+            head,
+        ]
+        if tail:
+            parts.extend(["", "BEGIN PRESERVED TAIL", tail])
+        return "\n".join(parts)
 
     def _estimate_tokens(self, messages: List[Dict[str, Any]]) -> int:
         total = 0
@@ -251,6 +374,7 @@ class CosContextEngine(ContextEngine):
             "hot_zone_turns_current": self.hot_zone_turns_current,
             "warm_zone_turns_current": self.warm_zone_turns_current,
             "cold_zone_turns_total": self.cold_zone_turns_total,
+            "hot_tool_compactions_count": self.hot_tool_compactions_count,
             "last_digest_latency_ms": self.last_digest_latency_ms,
             "digest_failures_count": self.digest_failures_count,
             "sync_digest_fallbacks_count": self.sync_digest_fallbacks_count,
@@ -265,6 +389,7 @@ class CosContextEngine(ContextEngine):
         super().on_session_reset()
         self.hot_zone_turns_current = 0
         self.warm_zone_turns_current = 0
+        self.hot_tool_compactions_count = 0
 
 
 def register(ctx) -> None:

@@ -169,6 +169,14 @@ from agent.tool_guardrails import (
     append_toolguard_guidance,
     toolguard_synthetic_result,
 )
+from agent.tool_router import (
+    TOOL_ROUTER_NAME,
+    ToolRouter,
+    build_tool_router_schema,
+    normalize_tool_routing_config,
+    parse_router_arguments_checked,
+    router_json,
+)
 from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
@@ -314,7 +322,7 @@ class IterationBudget:
 
 # Tools that must never run concurrently (interactive / user-facing).
 # When any of these appear in a batch, we fall back to sequential execution.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
+_NEVER_PARALLEL_TOOLS = frozenset({"clarify", TOOL_ROUTER_NAME})
 
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
@@ -1579,6 +1587,21 @@ class AIAgent:
                 print(f"🔄 Fallback chain ({len(self._fallback_chain)} providers): " +
                       " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
 
+        # Load config once for memory, skills, compression, and tool routing.
+        try:
+            from hermes_cli.config import load_config as _load_agent_config
+            _agent_cfg = _load_agent_config()
+        except Exception:
+            _agent_cfg = {}
+        _agent_section = _agent_cfg.get("agent", {}) if isinstance(_agent_cfg, dict) else {}
+        self._tool_routing_config = normalize_tool_routing_config(_agent_section)
+        self._tool_router_enabled = self._tool_routing_config.get("mode") == "router"
+        self._tool_router: ToolRouter | None = None
+        self._routable_tools: List[Dict[str, Any]] = []
+        self._routable_tool_names: set[str] = set()
+        self._router_skill_entries: List[Dict[str, Any]] = []
+        self._model_visible_tool_names: set[str] = set()
+
         # Get available tools with filtering
         self.tools = get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
@@ -1675,12 +1698,6 @@ class AIAgent:
         from tools.todo_tool import TodoStore
         self._todo_store = TodoStore()
         
-        # Load config once for memory, skills, and compression sections
-        try:
-            from hermes_cli.config import load_config as _load_agent_config
-            _agent_cfg = _load_agent_config()
-        except Exception:
-            _agent_cfg = {}
         try:
             self._tool_guardrails = ToolCallGuardrailController(
                 ToolCallGuardrailConfig.from_mapping(
@@ -2064,6 +2081,8 @@ class AIAgent:
                     self.valid_tool_names.add(_tname)
                     self._context_engine_tool_names.add(_tname)
                     _existing_tool_names.add(_tname)
+
+        self._finalize_tool_surface()
 
         # Notify context engine of session start
         if hasattr(self, "context_compressor") and self.context_compressor:
@@ -3820,6 +3839,119 @@ class AIAgent:
         # Return everything up to (not including) the last assistant message
         return messages[:last_assistant_idx]
 
+    def _tool_names_from_schemas(self, tools: List[Dict[str, Any]] | None) -> set[str]:
+        names: set[str] = set()
+        for tool in tools or []:
+            if not isinstance(tool, dict):
+                continue
+            name = tool.get("function", {}).get("name")
+            if name:
+                names.add(str(name))
+        return names
+
+    def _finalize_tool_surface(self) -> None:
+        """Apply single-tool router mode after all providers have added tools."""
+        self._routable_tools = list(self.tools or [])
+        self._routable_tool_names = self._tool_names_from_schemas(self._routable_tools)
+        self.valid_tool_names = set(self._routable_tool_names)
+
+        if not self._tool_router_enabled:
+            self._tool_router = None
+            self._router_skill_entries = []
+            self._model_visible_tool_names = set(self.valid_tool_names)
+            return
+
+        self._router_skill_entries = self._load_router_skill_entries()
+        self._tool_router = ToolRouter(
+            self._routable_tools,
+            skill_entries=self._router_skill_entries,
+            search_limit=self._tool_routing_config.get("search_limit", 8),
+            embedding_index=self._tool_routing_config.get("embedding_index", True),
+            toolset_lookup=get_toolset_for_tool,
+        )
+        router_schema = build_tool_router_schema(
+            catalog_count=len(self._tool_router.entries) + len(self._tool_router.skill_entries),
+            catalog_hash=self._tool_router.catalog_hash,
+        )
+        self.tools = [{"type": "function", "function": router_schema}]
+        self._model_visible_tool_names = {TOOL_ROUTER_NAME}
+        if not self.quiet_mode:
+            print(
+                f"🧭 Tool router enabled: exposing 1 tool, "
+                f"routing {len(self._routable_tool_names)} hidden tools "
+                f"and {len(self._router_skill_entries)} skills"
+            )
+
+    def _load_router_skill_entries(self) -> List[Dict[str, Any]]:
+        """Load compact skill metadata for router search results."""
+        if "skill_view" not in self.valid_tool_names and "skills_list" not in self.valid_tool_names:
+            return []
+        try:
+            from tools.skills_tool import skills_list
+            payload = json.loads(skills_list())
+        except Exception:
+            return []
+        if not isinstance(payload, dict) or not payload.get("success"):
+            return []
+        skills = payload.get("skills")
+        return [dict(item) for item in skills if isinstance(item, dict)] if isinstance(skills, list) else []
+
+    def _enabled_tool_names_for_dispatch(self) -> List[str] | None:
+        names = set(self._routable_tool_names or set()) | set(self.valid_tool_names or set())
+        return list(names) if names else None
+
+    def _visible_tool_names_for_model(self) -> set[str]:
+        # The API only receives ``_model_visible_tool_names`` in router mode,
+        # but accepting hidden names here keeps old transcripts/tests and
+        # provider text-tool parsers from hard-failing if a model emits a
+        # remembered direct tool name. The prompt/schema still expose only the
+        # router.
+        return (
+            set(self._model_visible_tool_names or set())
+            | set(self._routable_tool_names or set())
+            | set(self.valid_tool_names or set())
+        )
+
+    def get_tool_routing_status(self) -> Dict[str, Any]:
+        if self._tool_router_enabled and self._tool_router is not None:
+            return self._tool_router.status(exposed_tool_count=len(self.tools or []))
+        return {
+            "mode": "direct",
+            "exposed_tool_count": len(self.tools or []),
+            "hidden_tool_count": 0,
+            "hidden_skill_count": 0,
+            "catalog_hash": "",
+            "embedding_status": "disabled",
+        }
+
+    def refresh_tool_surface(self) -> None:
+        """Refresh registry-backed tools after dynamic MCP/plugin changes."""
+        self.tools = get_tool_definitions(
+            enabled_toolsets=self.enabled_toolsets,
+            disabled_toolsets=self.disabled_toolsets,
+            quiet_mode=True,
+        )
+        self.valid_tool_names = self._tool_names_from_schemas(self.tools)
+        if self._memory_manager and self.tools is not None:
+            existing = self._tool_names_from_schemas(self.tools)
+            for schema in self._memory_manager.get_all_tool_schemas():
+                name = schema.get("name", "")
+                if name and name not in existing:
+                    self.tools.append({"type": "function", "function": schema})
+                    existing.add(name)
+        self._context_engine_tool_names = set()
+        if hasattr(self, "context_compressor") and self.context_compressor and self.tools is not None:
+            existing = self._tool_names_from_schemas(self.tools)
+            for schema in self.context_compressor.get_tool_schemas():
+                name = schema.get("name", "")
+                if name and name not in existing:
+                    self.tools.append({"type": "function", "function": schema})
+                    self._context_engine_tool_names.add(name)
+                    existing.add(name)
+                elif name:
+                    self._context_engine_tool_names.add(name)
+        self._finalize_tool_surface()
+
     def _format_tools_for_system_message(self) -> str:
         """
         Format tool definitions for the system message in the trajectory format.
@@ -4321,6 +4453,7 @@ class AIAgent:
                 "last_updated": datetime.now().isoformat(),
                 "system_prompt": self._cached_system_prompt or "",
                 "tools": self.tools or [],
+                "tool_routing": self.get_tool_routing_status(),
                 "message_count": len(cleaned),
                 "messages": cleaned,
             }
@@ -4885,6 +5018,13 @@ class AIAgent:
             tool_guidance.append(KANBAN_GUIDANCE)
         if tool_guidance:
             prompt_parts.append(" ".join(tool_guidance))
+        if self._tool_router_enabled:
+            prompt_parts.append(
+                "Tool surface is routed: the only schema exposed to you is "
+                "tool_router. Use tool_router.search to find tools, "
+                "tool_router.describe to inspect exact arguments, and "
+                "tool_router.execute to run the chosen tool."
+            )
 
         nous_subscription_prompt = build_nous_subscription_prompt(self.valid_tool_names)
         if nous_subscription_prompt:
@@ -5293,7 +5433,11 @@ class AIAgent:
                 logger.warning("Removed duplicate tool call: %s", tc.function.name)
         return unique if len(unique) < len(tool_calls) else tool_calls
 
-    def _repair_tool_call(self, tool_name: str) -> str | None:
+    def _repair_tool_call(
+        self,
+        tool_name: str,
+        candidate_names: Optional[set[str]] = None,
+    ) -> str | None:
         """Attempt to repair a mismatched tool name before aborting.
 
         Models sometimes emit variants of a tool name that differ only
@@ -5312,13 +5456,14 @@ class AIAgent:
         See #14784 for the original reports (TodoTool_tool, Patch_tool,
         BrowserClick_tool were all returning "Unknown tool" before).
 
-        Returns the repaired name if found in valid_tool_names, else None.
+        Returns the repaired name if found in the candidate set, else None.
         """
         import re
         from difflib import get_close_matches
 
         if not tool_name:
             return None
+        valid_names = set(candidate_names or self.valid_tool_names)
 
         def _norm(s: str) -> str:
             return s.lower().replace("-", "_").replace(" ", "_")
@@ -5335,10 +5480,10 @@ class AIAgent:
 
         # Cheap fast-paths first — these cover the common case.
         lowered = tool_name.lower()
-        if lowered in self.valid_tool_names:
+        if lowered in valid_names:
             return lowered
         normalized = _norm(tool_name)
-        if normalized in self.valid_tool_names:
+        if normalized in valid_names:
             return normalized
 
         # Build the full candidate set for class-like emissions.
@@ -5355,11 +5500,11 @@ class AIAgent:
             cands |= extra
 
         for c in cands:
-            if c and c in self.valid_tool_names:
+            if c and c in valid_names:
                 return c
 
         # Fuzzy match as last resort.
-        matches = get_close_matches(lowered, self.valid_tool_names, n=1, cutoff=0.7)
+        matches = get_close_matches(lowered, valid_names, n=1, cutoff=0.7)
         if matches:
             return matches[0]
 
@@ -9261,6 +9406,465 @@ class AIAgent:
             parent_agent=self,
         )
 
+    def _maybe_checkpoint_for_routed_tool(
+        self,
+        function_name: str,
+        function_args: dict,
+        effective_task_id: str,
+    ) -> None:
+        """Mirror pre-execution checkpoints for tools called through the router."""
+        if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
+            try:
+                file_path = function_args.get("path", "")
+                if file_path:
+                    work_dir = self._checkpoint_mgr.get_working_dir_for_path(file_path)
+                    self._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
+            except Exception:
+                pass
+        if function_name == "terminal" and self._checkpoint_mgr.enabled:
+            try:
+                cmd = function_args.get("command", "")
+                if _is_destructive_command(cmd):
+                    cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                    self._checkpoint_mgr.ensure_checkpoint(
+                        cwd, f"before terminal: {cmd[:60]}"
+                    )
+            except Exception:
+                pass
+
+    def _router_config_int(self, key: str, default: int) -> int:
+        try:
+            value = int(self._tool_routing_config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return max(1, value)
+
+    def _router_history_preview(self, value: Any, *, limit: int | None = None) -> str:
+        limit = limit or self._router_config_int("history_preview_chars", 600)
+        if not isinstance(value, str):
+            try:
+                value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                value = str(value)
+        value = " ".join(value.split())
+        if len(value) <= limit:
+            return value
+        return value[: max(0, limit - 3)].rstrip() + "..."
+
+    def _compact_router_history_payload(self, content: str, *, execute_seen: int = 0) -> str | None:
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        action = payload.get("action")
+        if action == "search":
+            matches = payload.get("matches") or []
+            compact_matches = []
+            for match in matches[:8]:
+                if isinstance(match, dict) and match.get("name"):
+                    compact_matches.append(match.get("name"))
+            return router_json({
+                "success": payload.get("success", True),
+                "action": "search",
+                "query": payload.get("query", ""),
+                "compacted": True,
+                "matches": compact_matches,
+                "catalog_hash": payload.get("catalog_hash", ""),
+            })
+        if action == "describe":
+            if payload.get("type") == "skill":
+                return router_json({
+                    "success": payload.get("success", True),
+                    "action": "describe",
+                    "type": "skill",
+                    "name": payload.get("name", ""),
+                    "skill_name": payload.get("skill_name", ""),
+                    "category": payload.get("category", ""),
+                    "compacted": True,
+                    "description": self._router_history_preview(payload.get("description"), limit=300),
+                    "catalog_hash": payload.get("catalog_hash", ""),
+                })
+            schema = payload.get("schema") if isinstance(payload.get("schema"), dict) else {}
+            params = schema.get("parameters") if isinstance(schema.get("parameters"), dict) else {}
+            props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+            required = params.get("required") if isinstance(params.get("required"), list) else []
+            return router_json({
+                "success": payload.get("success", True),
+                "action": "describe",
+                "tool_name": payload.get("tool_name", schema.get("name", "")),
+                "toolset": payload.get("toolset", ""),
+                "compacted": True,
+                "schema_summary": {
+                    "parameters": sorted(str(name) for name in props.keys())[:24],
+                    "required": [str(item) for item in required[:12]],
+                },
+                "catalog_hash": payload.get("catalog_hash", ""),
+            })
+        if action == "execute":
+            limit = self._router_config_int("history_execute_inline_chars", 2000)
+            if execute_seen == 0 and len(content) <= limit:
+                return None
+            if len(content) <= limit:
+                return None
+            return router_json({
+                "success": payload.get("success", True),
+                "action": "execute",
+                "tool_name": payload.get("tool_name", ""),
+                "duration_ms": payload.get("duration_ms"),
+                "compacted": True,
+                "original_chars": len(content),
+                "result_preview": self._router_history_preview(payload.get("result")),
+            })
+        return None
+
+    def _compact_prior_router_context(self, messages: list | None) -> None:
+        """Shrink old router tool results before adding another router result."""
+        if not messages or not self._tool_routing_config.get("compact_history", True):
+            return
+        execute_seen = 0
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+            compacted = self._compact_router_history_payload(content, execute_seen=execute_seen)
+            try:
+                payload = json.loads(content)
+            except (TypeError, ValueError):
+                payload = {}
+            if isinstance(payload, dict) and payload.get("action") == "execute":
+                execute_seen += 1
+            if compacted and compacted != content:
+                msg["content"] = compacted
+
+    def _record_tool_router_event(
+        self,
+        *,
+        action: str,
+        tool_call_id: Optional[str] = None,
+        query: str | None = None,
+        requested_name: str | None = None,
+        resolved_name: str | None = None,
+        target_type: str | None = None,
+        target_tool: str | None = None,
+        success: bool | None = None,
+        outcome: str | None = None,
+        error: str | None = None,
+        matches: list | None = None,
+        result_chars: int | None = None,
+        result_compacted: bool | None = None,
+    ) -> None:
+        if not self._tool_routing_config.get("telemetry", True):
+            return
+        try:
+            from agent.tool_router_telemetry import record_router_event
+            status = self.get_tool_routing_status()
+            compact_matches = []
+            for match in (matches or [])[:10]:
+                if not isinstance(match, dict):
+                    continue
+                compact_matches.append({
+                    "type": match.get("type"),
+                    "name": match.get("name"),
+                    "skill_name": match.get("skill_name"),
+                    "score": match.get("score"),
+                })
+            record_router_event({
+                "session_id": self.session_id,
+                "tool_call_id": tool_call_id,
+                "action": action,
+                "query": query,
+                "requested_name": requested_name,
+                "resolved_name": resolved_name,
+                "target_type": target_type,
+                "target_tool": target_tool,
+                "success": success,
+                "outcome": outcome,
+                "error": error,
+                "match_count": len(matches or []),
+                "matches": compact_matches,
+                "result_chars": result_chars,
+                "result_compacted": result_compacted,
+                "catalog_hash": status.get("catalog_hash"),
+                "hidden_tool_count": status.get("hidden_tool_count"),
+                "hidden_skill_count": status.get("hidden_skill_count"),
+                "model": self.model,
+                "provider": self.provider,
+                "platform": self.platform,
+            })
+        except Exception:
+            pass
+
+    def _budget_routed_execute_result(
+        self,
+        *,
+        target_name: str,
+        result_type: str = "tool",
+        result: str,
+        effective_task_id: str,
+        tool_call_id: Optional[str],
+    ) -> tuple[str, bool]:
+        """Apply a tighter inline budget before embedding a target result in router JSON."""
+        if "MEDIA:" in result:
+            return result, False
+        if result_type == "skill":
+            threshold = self._router_config_int("skill_result_inline_chars", 20000)
+        else:
+            threshold = self._router_config_int("execute_result_inline_chars", 3000)
+        if len(result) <= threshold:
+            return result, False
+        persisted = maybe_persist_tool_result(
+            content=result,
+            tool_name=target_name,
+            tool_use_id=f"{tool_call_id or uuid.uuid4().hex[:12]}_{target_name}",
+            env=get_active_env(effective_task_id),
+            threshold=threshold,
+        )
+        return persisted, persisted != result
+
+    def _handle_tool_router_call(
+        self,
+        function_args: dict,
+        effective_task_id: str,
+        tool_call_id: Optional[str] = None,
+        messages: list = None,
+    ) -> str:
+        """Handle the single exposed tool_router call."""
+        if not self._tool_router_enabled or self._tool_router is None:
+            return router_json({
+                "success": False,
+                "error": "tool_router is disabled; set agent.tool_routing.mode to 'router' to enable it.",
+            })
+
+        action = str(function_args.get("action") or "").strip().lower()
+        self._compact_prior_router_context(messages)
+        if action == "search":
+            query = function_args.get("query", "")
+            search_result = self._tool_router.search(
+                query,
+                limit=function_args.get("limit"),
+            )
+            self._record_tool_router_event(
+                action="search",
+                tool_call_id=tool_call_id,
+                query=str(query or ""),
+                success=True,
+                outcome="search_results" if search_result.get("matches") else "search_no_matches",
+                matches=search_result.get("matches") or [],
+            )
+            return router_json(search_result)
+        if action == "describe":
+            requested = str(function_args.get("tool_name", "") or "")
+            describe_result = self._tool_router.describe(requested)
+            self._record_tool_router_event(
+                action="describe",
+                tool_call_id=tool_call_id,
+                requested_name=requested,
+                resolved_name=describe_result.get("tool_name") or describe_result.get("name"),
+                target_type=describe_result.get("type"),
+                success=bool(describe_result.get("success")),
+                outcome="describe_success" if describe_result.get("success") else "describe_unknown",
+                error=describe_result.get("error"),
+                matches=describe_result.get("suggestions") or [],
+            )
+            return router_json(describe_result)
+        if action != "execute":
+            self._record_tool_router_event(
+                action=action or "<empty>",
+                tool_call_id=tool_call_id,
+                success=False,
+                outcome="invalid_action",
+                error="Invalid router action.",
+            )
+            return router_json({
+                "success": False,
+                "error": "Invalid router action. Use one of: search, describe, execute.",
+                "action": action,
+            })
+
+        target_name = str(function_args.get("tool_name") or "").strip()
+        target_args, target_args_error = parse_router_arguments_checked(function_args.get("arguments"))
+        if not target_name:
+            self._record_tool_router_event(
+                action="execute",
+                tool_call_id=tool_call_id,
+                success=False,
+                outcome="missing_target",
+                error="action='execute' requires tool_name.",
+            )
+            return router_json({"success": False, "error": "action='execute' requires tool_name."})
+        if target_args_error:
+            self._record_tool_router_event(
+                action="execute",
+                tool_call_id=tool_call_id,
+                requested_name=target_name,
+                success=False,
+                outcome="malformed_arguments",
+                error=target_args_error,
+            )
+            return router_json({
+                "success": False,
+                "action": "execute",
+                "tool_name": target_name,
+                "error": target_args_error,
+            })
+        if target_name == TOOL_ROUTER_NAME:
+            self._record_tool_router_event(
+                action="execute",
+                tool_call_id=tool_call_id,
+                requested_name=target_name,
+                success=False,
+                outcome="recursion_blocked",
+                error="tool_router cannot execute itself.",
+            )
+            return router_json({"success": False, "error": "tool_router cannot execute itself."})
+
+        skill_entry = self._tool_router.skill_for_ref(target_name)
+        if skill_entry is not None:
+            if "skill_view" not in self._routable_tool_names:
+                self._record_tool_router_event(
+                    action="execute",
+                    tool_call_id=tool_call_id,
+                    requested_name=target_name,
+                    resolved_name=self._tool_router.skill_ref(skill_entry.name),
+                    target_type="skill",
+                    target_tool="skill_view",
+                    success=False,
+                    outcome="skill_view_unavailable",
+                    error="skill_view is not in the hidden tool catalog.",
+                )
+                return router_json({
+                    "success": False,
+                    "action": "execute",
+                    "tool_name": target_name,
+                    "type": "skill",
+                    "error": "Skill loading is unavailable because skill_view is not in the hidden tool catalog.",
+                })
+            routed_display_name = self._tool_router.skill_ref(skill_entry.name)
+            execution_name = "skill_view"
+            execution_args = {"name": skill_entry.name}
+            if isinstance(target_args, dict) and target_args.get("file_path"):
+                execution_args["file_path"] = target_args.get("file_path")
+            result_type = "skill"
+        else:
+            routed_display_name = target_name
+            execution_name = target_name
+            execution_args = target_args
+            result_type = "tool"
+
+        if execution_name not in self._routable_tool_names:
+            unknown_result = self._tool_router.unknown_tool(target_name)
+            self._record_tool_router_event(
+                action="execute",
+                tool_call_id=tool_call_id,
+                requested_name=target_name,
+                success=False,
+                outcome="unknown_target",
+                error=unknown_result.get("error"),
+                matches=unknown_result.get("suggestions") or [],
+            )
+            return router_json(unknown_result)
+
+        if execution_name == "memory":
+            self._turns_since_memory = 0
+        elif execution_name == "skill_manage":
+            self._iters_since_skill = 0
+
+        guardrail_decision = self._tool_guardrails.before_call(execution_name, execution_args)
+        if not guardrail_decision.allows_execution:
+            result = self._guardrail_block_result(guardrail_decision)
+            self._record_tool_router_event(
+                action="execute",
+                tool_call_id=tool_call_id,
+                requested_name=target_name,
+                resolved_name=routed_display_name,
+                target_type=result_type,
+                target_tool=execution_name,
+                success=False,
+                outcome="guardrail_blocked",
+                result_chars=len(result),
+            )
+            return router_json({
+                "success": False,
+                "action": "execute",
+                "tool_name": routed_display_name,
+                "target_tool": execution_name,
+                "type": result_type,
+                "blocked": True,
+                "result": result,
+            })
+
+        self._maybe_checkpoint_for_routed_tool(execution_name, execution_args, effective_task_id)
+        start = time.time()
+        try:
+            result = self._invoke_tool(
+                execution_name,
+                execution_args,
+                effective_task_id,
+                tool_call_id=tool_call_id,
+                messages=messages,
+                pre_tool_block_checked=False,
+            )
+        except Exception as tool_error:
+            result = json.dumps({"error": f"Error executing routed tool '{routed_display_name}': {tool_error}"})
+            logger.error("routed tool %s raised: %s", routed_display_name, tool_error, exc_info=True)
+
+        duration = time.time() - start
+        is_error, _ = _detect_tool_failure(execution_name, result)
+        result = self._append_guardrail_observation(
+            execution_name,
+            execution_args,
+            result,
+            failed=is_error,
+        )
+        result, result_compacted = self._budget_routed_execute_result(
+            target_name=execution_name,
+            result_type=result_type,
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+        )
+        if is_error:
+            logger.warning("Routed tool %s returned error (%.2fs): %s", routed_display_name, duration, result[:200])
+        else:
+            logger.info("routed tool %s completed (%.2fs, %d chars)", routed_display_name, duration, len(result))
+        envelope = {
+            "success": not is_error,
+            "action": "execute",
+            "tool_name": routed_display_name,
+            "type": result_type,
+            "duration_ms": int(duration * 1000),
+            "result": self._json_or_text(result),
+        }
+        if execution_name != routed_display_name:
+            envelope["target_tool"] = execution_name
+        if result_compacted:
+            envelope["result_compacted"] = True
+        self._record_tool_router_event(
+            action="execute",
+            tool_call_id=tool_call_id,
+            requested_name=target_name,
+            resolved_name=routed_display_name,
+            target_type=result_type,
+            target_tool=execution_name,
+            success=not is_error,
+            outcome="execute_success" if not is_error else "execute_error",
+            error=result[:1000] if is_error else None,
+            result_chars=len(result),
+            result_compacted=result_compacted,
+        )
+        return router_json(envelope)
+
+    @staticmethod
+    def _json_or_text(value: str) -> Any:
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return value
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False) -> str:
@@ -9272,7 +9876,7 @@ class AIAgent:
         """
         # Check plugin hooks for a block directive before executing anything.
         block_message: Optional[str] = None
-        if not pre_tool_block_checked:
+        if not pre_tool_block_checked and function_name != TOOL_ROUTER_NAME:
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 block_message = get_pre_tool_call_block_message(
@@ -9337,12 +9941,19 @@ class AIAgent:
             )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
+        elif function_name == TOOL_ROUTER_NAME:
+            return self._handle_tool_router_call(
+                function_args,
+                effective_task_id,
+                tool_call_id=tool_call_id,
+                messages=messages,
+            )
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
                 tool_call_id=tool_call_id,
                 session_id=self.session_id or "",
-                enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                enabled_tools=self._enabled_tool_names_for_dispatch(),
                 skip_pre_tool_call_hook=True,
             )
 
@@ -9782,16 +10393,17 @@ class AIAgent:
 
             # Check plugin hooks for a block directive before executing.
             _block_msg: Optional[str] = None
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                _block_msg = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
-                pass
+            if function_name != TOOL_ROUTER_NAME:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    _block_msg = get_pre_tool_call_block_message(
+                        function_name, function_args, task_id=effective_task_id or "",
+                    )
+                except Exception:
+                    pass
 
             _guardrail_block_decision: ToolGuardrailDecision | None = None
-            if _block_msg is None:
+            if _block_msg is None and function_name != TOOL_ROUTER_NAME:
                 guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
                 if not guardrail_decision.allows_execution:
                     _guardrail_block_decision = guardrail_decision
@@ -9967,6 +10579,20 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
+            elif function_name == TOOL_ROUTER_NAME:
+                try:
+                    function_result = self._handle_tool_router_call(
+                        function_args,
+                        effective_task_id,
+                        tool_call_id=getattr(tool_call, "id", None),
+                        messages=messages,
+                    )
+                except Exception as tool_error:
+                    function_result = json.dumps({"error": f"tool_router failed: {tool_error}"})
+                    logger.error("tool_router failed: %s", tool_error, exc_info=True)
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl(TOOL_ROUTER_NAME, function_args, tool_duration, result=function_result)}")
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None
@@ -10028,7 +10654,7 @@ class AIAgent:
                         function_name, function_args, effective_task_id,
                         tool_call_id=tool_call.id,
                         session_id=self.session_id or "",
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                        enabled_tools=self._enabled_tool_names_for_dispatch(),
                         skip_pre_tool_call_hook=True,
                     )
                     _spinner_result = function_result
@@ -10048,7 +10674,7 @@ class AIAgent:
                         function_name, function_args, effective_task_id,
                         tool_call_id=tool_call.id,
                         session_id=self.session_id or "",
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                        enabled_tools=self._enabled_tool_names_for_dispatch(),
                         skip_pre_tool_call_hook=True,
                     )
                 except Exception as tool_error:
@@ -10063,7 +10689,7 @@ class AIAgent:
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
-            if not _execution_blocked:
+            if not _execution_blocked and function_name != TOOL_ROUTER_NAME:
                 function_result = self._append_guardrail_observation(
                     function_name,
                     function_args,
@@ -10576,10 +11202,21 @@ class AIAgent:
         # while having a large existing session — compress proactively rather
         # than waiting for an API error (which might be caught as a non-retryable
         # 4xx and abort the request entirely).
-        if (
-            self.compression_enabled
-            and len(messages) > self.context_compressor.protect_first_n
-                                + self.context_compressor.protect_last_n + 1
+        _preflight_message_floor = (
+            len(messages) > self.context_compressor.protect_first_n
+                            + self.context_compressor.protect_last_n + 1
+        )
+        _preflight_engine_wants_compress = False
+        if self.compression_enabled:
+            try:
+                _preflight_engine_wants_compress = bool(
+                    self.context_compressor.should_compress_preflight(messages)
+                )
+            except Exception:
+                _preflight_engine_wants_compress = False
+
+        if self.compression_enabled and (
+            _preflight_message_floor or _preflight_engine_wants_compress
         ):
             # Include tool schema tokens — with many tools these can add
             # 20-30K+ tokens that the old sys+msg estimate missed entirely.
@@ -10589,7 +11226,10 @@ class AIAgent:
                 tools=self.tools or None,
             )
 
-            if _preflight_tokens >= self.context_compressor.threshold_tokens:
+            if (
+                _preflight_tokens >= self.context_compressor.threshold_tokens
+                or _preflight_engine_wants_compress
+            ):
                 logger.info(
                     "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
                     f"{_preflight_tokens:,}",
@@ -13008,22 +13648,26 @@ class AIAgent:
                     
                     # Validate tool call names - detect model hallucinations
                     # Repair mismatched tool names before validating
+                    _visible_tool_names = self._visible_tool_names_for_model()
                     for tc in assistant_message.tool_calls:
-                        if tc.function.name not in self.valid_tool_names:
-                            repaired = self._repair_tool_call(tc.function.name)
+                        if tc.function.name not in _visible_tool_names:
+                            repaired = self._repair_tool_call(
+                                tc.function.name,
+                                candidate_names=_visible_tool_names,
+                            )
                             if repaired:
                                 print(f"{self.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                                 tc.function.name = repaired
                     invalid_tool_calls = [
                         tc.function.name for tc in assistant_message.tool_calls
-                        if tc.function.name not in self.valid_tool_names
+                        if tc.function.name not in _visible_tool_names
                     ]
                     if invalid_tool_calls:
                         # Track retries for invalid tool calls
                         self._invalid_tool_retries += 1
 
                         # Return helpful error to model — model can self-correct next turn
-                        available = ", ".join(sorted(self.valid_tool_names))
+                        available = ", ".join(sorted(_visible_tool_names))
                         invalid_name = invalid_tool_calls[0]
                         invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
                         self._vprint(f"{self.log_prefix}⚠️  Unknown tool '{invalid_preview}' — sending error to model for self-correction ({self._invalid_tool_retries}/3)")
@@ -13044,7 +13688,7 @@ class AIAgent:
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                         messages.append(assistant_msg)
                         for tc in assistant_message.tool_calls:
-                            if tc.function.name not in self.valid_tool_names:
+                            if tc.function.name not in _visible_tool_names:
                                 content = f"Tool '{tc.function.name}' does not exist. Available tools: {available}"
                             else:
                                 content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
@@ -13790,6 +14434,8 @@ class AIAgent:
             "estimated_cost_usd": self.session_estimated_cost_usd,
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
+            "tools": self.tools or [],
+            "tool_routing": self.get_tool_routing_status(),
         }
         if self._tool_guardrail_halt_decision is not None:
             result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()

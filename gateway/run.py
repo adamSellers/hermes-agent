@@ -6426,6 +6426,7 @@ class GatewayRunner:
                     {
                         "role": "session_meta",
                         "tools": tool_defs or [],
+                        "tool_routing": agent_result.get("tool_routing") or {},
                         "model": _resolve_gateway_model(),
                         "platform": source.platform.value if source.platform else "",
                         "timestamp": ts,
@@ -10991,6 +10992,7 @@ class GatewayRunner:
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
         ("agent", "disabled_toolsets"),
+        ("agent", "tool_routing"),
     )
 
     @classmethod

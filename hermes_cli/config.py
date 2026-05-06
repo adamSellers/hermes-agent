@@ -462,6 +462,27 @@ DEFAULT_CONFIG = {
         # remains available as a tool regardless of this setting — the routing
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
+        # Tool routing controls the model-visible tool schema surface.
+        #   "router" — expose one stable tool_router schema and keep the full
+        #              platform catalog hidden for on-demand search/execute.
+        #   "direct" — legacy behavior; expose every enabled tool schema.
+        # Router mode is the default for local Hermes deployments because tool
+        # schemas can otherwise consume tens of thousands of prefill tokens.
+        "tool_routing": {
+            "mode": "router",
+            "search_limit": 8,
+            "embedding_index": True,
+            # Keep router discovery/execution history compact. Large routed
+            # execute results are previewed inline and persisted like normal
+            # tool results so follow-up turns do not carry full terminal/web
+            # payloads forever.
+            "compact_history": True,
+            "execute_result_inline_chars": 3000,
+            "skill_result_inline_chars": 20000,
+            "history_execute_inline_chars": 2000,
+            "history_preview_chars": 600,
+            "telemetry": True,
+        },
         "disabled_toolsets": [],
     },
     

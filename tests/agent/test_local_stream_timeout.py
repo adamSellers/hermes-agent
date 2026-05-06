@@ -99,6 +99,19 @@ class TestIsLocalEndpoint:
         assert is_local_endpoint(url) is True
 
     @pytest.mark.parametrize("url", [
+        "http://lathe.oakroad:8000/v1",
+        "http://studio.local:8000/v1",
+        "http://nuc.lan:11434",
+    ])
+    def test_home_lab_dns_suffixes_are_local(self, url):
+        assert is_local_endpoint(url) is True
+
+    def test_custom_local_endpoint_suffix_env(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LOCAL_ENDPOINT_SUFFIXES", ".mesh")
+        assert is_local_endpoint("http://inference.mesh:8000/v1") is True
+        assert is_local_endpoint("http://lathe.oakroad:8000/v1") is False
+
+    @pytest.mark.parametrize("url", [
         "https://api.openai.com",
         "https://openrouter.ai/api",
         "https://api.anthropic.com",

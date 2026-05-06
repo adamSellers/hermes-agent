@@ -4454,6 +4454,27 @@ class HermesCLI:
         # Get tool count
         tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
         tool_count = len(tools) if tools else 0
+        tool_label = f"{tool_count} tools"
+        try:
+            if getattr(self, "agent", None) and hasattr(self.agent, "get_tool_routing_status"):
+                routing = self.agent.get_tool_routing_status()
+                if routing.get("mode") == "router":
+                    hidden_tools = routing.get("hidden_tool_count", tool_count)
+                    hidden_skills = routing.get("hidden_skill_count", 0)
+                    hidden_label = f"{hidden_tools} hidden"
+                    if hidden_skills:
+                        hidden_label = f"{hidden_tools} tools · {hidden_skills} skills"
+                    tool_label = (
+                        f"{routing.get('exposed_tool_count', 1)} router tool"
+                        f" · {hidden_label}"
+                    )
+            else:
+                from agent.tool_router import normalize_tool_routing_config
+                routing_cfg = normalize_tool_routing_config((CLI_CONFIG or {}).get("agent", {}))
+                if routing_cfg.get("mode") == "router" and tool_count:
+                    tool_label = f"1 router tool · {tool_count} hidden"
+        except Exception:
+            pass
 
         # Format model name (shorten if needed)
         model_short = self.model.split("/")[-1] if "/" in self.model else self.model
@@ -4485,7 +4506,7 @@ class HermesCLI:
 
         self._console_print(
             f"  {api_indicator} [{accent_color}]{model_short}[/] "
-            f"[dim {separator_color}]·[/] [bold {label_color}]{tool_count} tools[/]"
+            f"[dim {separator_color}]·[/] [bold {label_color}]{tool_label}[/]"
             f"{toolsets_info}{provider_info}"
         )
 
@@ -7918,14 +7939,17 @@ class HermesCLI:
 
             # Refresh the agent's tool list so the model can call new tools
             if self.agent is not None:
-                self.agent.tools = get_tool_definitions(
-                    enabled_toolsets=self.agent.enabled_toolsets
-                    if hasattr(self.agent, "enabled_toolsets") else None,
-                    quiet_mode=True,
-                )
-                self.agent.valid_tool_names = {
-                    tool["function"]["name"] for tool in self.agent.tools
-                } if self.agent.tools else set()
+                if hasattr(self.agent, "refresh_tool_surface"):
+                    self.agent.refresh_tool_surface()
+                else:
+                    self.agent.tools = get_tool_definitions(
+                        enabled_toolsets=self.agent.enabled_toolsets
+                        if hasattr(self.agent, "enabled_toolsets") else None,
+                        quiet_mode=True,
+                    )
+                    self.agent.valid_tool_names = {
+                        tool["function"]["name"] for tool in self.agent.tools
+                    } if self.agent.tools else set()
 
             # Inject a message at the END of conversation history so the
             # model knows tools changed.  Appended after all existing

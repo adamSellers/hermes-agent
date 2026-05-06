@@ -21,6 +21,7 @@ from agent.codex_responses_adapter import _chat_messages_to_responses_input, _no
 import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
+from agent.model_metadata import estimate_request_tokens_rough
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 
@@ -761,6 +762,151 @@ class TestInit:
                 skip_memory=True,
             )
             assert a.valid_tool_names == {"web_search", "terminal"}
+
+    def test_router_mode_exposes_single_tool_with_hidden_catalog(self):
+        tool_names = [f"catalog_tool_{idx}" for idx in range(20)]
+        tools = _make_tool_defs(*tool_names)
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"tool_routing": {"mode": "router", "embedding_index": False}}},
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert [tool["function"]["name"] for tool in a.tools] == ["tool_router"]
+        assert a.valid_tool_names == set(tool_names)
+        assert estimate_request_tokens_rough([], tools=a.tools) < estimate_request_tokens_rough([], tools=tools)
+        status = a.get_tool_routing_status()
+        assert status["mode"] == "router"
+        assert status["exposed_tool_count"] == 1
+        assert status["hidden_tool_count"] == len(tool_names)
+
+    def test_router_mode_preserves_provider_and_context_tools_hidden(self):
+        class FakeMemoryProvider:
+            name = "fake_memory"
+
+            def is_available(self):
+                return True
+
+            def initialize(self, **kwargs):
+                return None
+
+            def get_tool_schemas(self):
+                return [
+                    {
+                        "name": "memory_provider_tool",
+                        "description": "memory provider tool",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ]
+
+        class FakeContextCompressor:
+            context_length = 200_000
+            threshold_tokens = 100_000
+            model = ""
+            base_url = ""
+            api_key = ""
+            provider = ""
+
+            def __init__(self, *args, **kwargs):
+                return None
+
+            def get_tool_schemas(self):
+                return [
+                    {
+                        "name": "context_engine_tool",
+                        "description": "context engine tool",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ]
+
+            def on_session_start(self, *args, **kwargs):
+                return None
+
+        tools = _make_tool_defs("registry_tool", "memory")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("run_agent.ContextCompressor", FakeContextCompressor),
+            patch("plugins.memory.load_memory_provider", return_value=FakeMemoryProvider()),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "agent": {"tool_routing": {"mode": "router", "embedding_index": False}},
+                    "memory": {"provider": "fake_memory"},
+                },
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+            )
+
+        assert [tool["function"]["name"] for tool in a.tools] == ["tool_router"]
+        assert a.valid_tool_names == {
+            "registry_tool",
+            "memory",
+            "memory_provider_tool",
+            "context_engine_tool",
+        }
+        status = a.get_tool_routing_status()
+        assert status["exposed_tool_count"] == 1
+        assert status["hidden_tool_count"] == 4
+
+    def test_router_mode_indexes_skills_as_hidden_catalog_entries(self):
+        tools = _make_tool_defs("skill_view", "skills_list", "terminal")
+        skills_payload = {
+            "success": True,
+            "skills": [
+                {
+                    "name": "weather-lookup",
+                    "description": "Resolve local weekend weather forecasts.",
+                    "category": "research",
+                }
+            ],
+        }
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("tools.skills_tool.skills_list", return_value=json.dumps(skills_payload)),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"tool_routing": {"mode": "router", "embedding_index": False}}},
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        status = a.get_tool_routing_status()
+        assert status["hidden_tool_count"] == 3
+        assert status["hidden_skill_count"] == 1
+        result = json.loads(a._invoke_tool(
+            "tool_router",
+            {"action": "search", "query": "weather forecast"},
+            "task-1",
+        ))
+        assert result["matches"][0]["type"] == "skill"
+        assert result["matches"][0]["name"] == "skill:weather-lookup"
 
     def test_session_id_auto_generated(self):
         """Session ID should be auto-generated in YYYYMMDD_HHMMSS_<hex6> format."""
@@ -1970,6 +2116,312 @@ class TestConcurrentToolExecution:
                 skip_pre_tool_call_hook=True,
             )
             assert result == "result"
+
+    def test_tool_router_execute_dispatches_hidden_tool(self, agent):
+        """tool_router.execute should run hidden tools through the normal dispatcher."""
+        with patch("run_agent.handle_function_call", return_value='{"ok": true}') as mock_hfc:
+            result = agent._invoke_tool(
+                "tool_router",
+                {
+                    "action": "execute",
+                    "tool_name": "web_search",
+                    "arguments": {"q": "test"},
+                },
+                "task-1",
+                tool_call_id="router-call-1",
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is True
+        assert payload["tool_name"] == "web_search"
+        assert payload["result"] == {"ok": True}
+        mock_hfc.assert_called_once()
+        call = mock_hfc.call_args
+        assert call.args == ("web_search", {"q": "test"}, "task-1")
+        assert call.kwargs["tool_call_id"] == "router-call-1"
+        assert call.kwargs["session_id"] == agent.session_id
+        assert set(call.kwargs["enabled_tools"]) == agent.valid_tool_names
+        assert call.kwargs["skip_pre_tool_call_hook"] is True
+
+    def test_tool_router_blocks_recursion(self, agent):
+        result = agent._invoke_tool(
+            "tool_router",
+            {"action": "execute", "tool_name": "tool_router", "arguments": {}},
+            "task-1",
+        )
+
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "cannot execute itself" in payload["error"]
+
+    def test_tool_router_execute_rejects_malformed_arguments(self, agent):
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+            result = agent._invoke_tool(
+                "tool_router",
+                {
+                    "action": "execute",
+                    "tool_name": "web_search",
+                    "arguments": "not json",
+                },
+                "task-1",
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "arguments must be" in payload["error"]
+
+    def test_tool_router_execute_code_gets_hidden_allowlist(self):
+        tools = _make_tool_defs("execute_code", "web_search")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"tool_routing": {"mode": "router", "embedding_index": False}}},
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        with patch("run_agent.handle_function_call", return_value='{"ok": true}') as mock_hfc:
+            result = a._invoke_tool(
+                "tool_router",
+                {
+                    "action": "execute",
+                    "tool_name": "execute_code",
+                    "arguments": {"code": "print('hi')"},
+                },
+                "task-1",
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is True
+        assert set(mock_hfc.call_args.kwargs["enabled_tools"]) == {"execute_code", "web_search"}
+        assert "tool_router" not in mock_hfc.call_args.kwargs["enabled_tools"]
+
+    def test_tool_router_execute_compacts_large_target_result(self, agent):
+        agent._tool_routing_config["execute_result_inline_chars"] = 1000
+        large_result = json.dumps({"output": "x" * 5000, "exit_code": 0})
+
+        with (
+            patch("run_agent.handle_function_call", return_value=large_result),
+            patch("run_agent.get_active_env", return_value=None),
+        ):
+            result = agent._invoke_tool(
+                "tool_router",
+                {
+                    "action": "execute",
+                    "tool_name": "web_search",
+                    "arguments": {"q": "test"},
+                },
+                "task-1",
+                tool_call_id="router-large",
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is True
+        assert payload["result_compacted"] is True
+        assert isinstance(payload["result"], str)
+        assert "Truncated" in payload["result"]
+        assert len(result) < len(large_result)
+
+    def test_tool_router_records_search_telemetry(self, agent):
+        with patch("agent.tool_router_telemetry.record_router_event") as mock_record:
+            result = agent._invoke_tool(
+                "tool_router",
+                {"action": "search", "query": "web search"},
+                "task-1",
+                tool_call_id="router-search-1",
+            )
+
+        assert json.loads(result)["success"] is True
+        event = mock_record.call_args.args[0]
+        assert event["action"] == "search"
+        assert event["query"] == "web search"
+        assert event["tool_call_id"] == "router-search-1"
+        assert event["success"] is True
+        assert event["hidden_tool_count"] >= 1
+
+    def test_tool_router_execute_compacts_prior_discovery_messages(self, agent):
+        prior_search = agent._invoke_tool(
+            "tool_router",
+            {"action": "search", "query": "web search weather"},
+            "task-1",
+            tool_call_id="search-1",
+        )
+        prior_describe = agent._invoke_tool(
+            "tool_router",
+            {"action": "describe", "tool_name": "web_search"},
+            "task-1",
+            tool_call_id="describe-1",
+        )
+        messages = [
+            {"role": "tool", "content": prior_search, "tool_call_id": "search-1"},
+            {"role": "tool", "content": prior_describe, "tool_call_id": "describe-1"},
+        ]
+
+        with patch("run_agent.handle_function_call", return_value='{"ok": true}'):
+            result = agent._invoke_tool(
+                "tool_router",
+                {
+                    "action": "execute",
+                    "tool_name": "web_search",
+                    "arguments": {"q": "test"},
+                },
+                "task-1",
+                messages=messages,
+            )
+
+        assert json.loads(result)["success"] is True
+        compacted_search = json.loads(messages[0]["content"])
+        compacted_describe = json.loads(messages[1]["content"])
+        assert compacted_search["compacted"] is True
+        assert compacted_search["matches"] == ["web_search"]
+        assert compacted_describe["compacted"] is True
+        assert "schema" not in compacted_describe
+        assert compacted_describe["schema_summary"]["parameters"] == []
+
+    def test_tool_router_execute_skill_routes_to_skill_view(self):
+        tools = _make_tool_defs("skill_view", "skills_list")
+        skills_payload = {
+            "success": True,
+            "skills": [
+                {
+                    "name": "weather-lookup",
+                    "description": "Resolve local weather forecasts.",
+                    "category": "research",
+                }
+            ],
+        }
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("tools.skills_tool.skills_list", return_value=json.dumps(skills_payload)),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"tool_routing": {"mode": "router", "embedding_index": False}}},
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        large_skill_content = "loaded skill instructions\n" * 250
+        with patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"success": True, "content": large_skill_content}),
+        ) as mock_hfc:
+            result = a._invoke_tool(
+                "tool_router",
+                {
+                    "action": "execute",
+                    "tool_name": "skill:weather-lookup",
+                    "arguments": {},
+                },
+                "task-1",
+                tool_call_id="skill-call-1",
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is True
+        assert payload["type"] == "skill"
+        assert payload["tool_name"] == "skill:weather-lookup"
+        assert payload["target_tool"] == "skill_view"
+        assert payload["result"]["content"] == large_skill_content
+        assert "result_compacted" not in payload
+        call = mock_hfc.call_args
+        assert call.args == ("skill_view", {"name": "weather-lookup"}, "task-1")
+        assert call.kwargs["tool_call_id"] == "skill-call-1"
+
+    def test_tool_router_execute_runs_target_pre_tool_hook_once(self, agent, monkeypatch):
+        calls = []
+
+        def fake_pre_hook(name, args, *, task_id=""):
+            calls.append((name, args, task_id))
+            return None
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            fake_pre_hook,
+        )
+
+        with patch("run_agent.handle_function_call", return_value='{"ok": true}'):
+            result = agent._invoke_tool(
+                "tool_router",
+                {
+                    "action": "execute",
+                    "tool_name": "web_search",
+                    "arguments": {"q": "test"},
+                },
+                "task-1",
+            )
+
+        assert json.loads(result)["success"] is True
+        assert calls == [("web_search", {"q": "test"}, "task-1")]
+
+    def test_tool_router_execute_runs_target_post_tool_hook_once(self, agent, monkeypatch):
+        post_calls = []
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *args, **kwargs: None,
+        )
+
+        def fake_invoke_hook(event, **kwargs):
+            if event == "post_tool_call":
+                post_calls.append((kwargs["tool_name"], kwargs["args"], kwargs["task_id"]))
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+
+        with patch("model_tools.registry.dispatch", return_value='{"ok": true}'):
+            result = agent._invoke_tool(
+                "tool_router",
+                {
+                    "action": "execute",
+                    "tool_name": "web_search",
+                    "arguments": {"q": "test"},
+                },
+                "task-1",
+            )
+
+        assert json.loads(result)["success"] is True
+        assert post_calls == [("web_search", {"q": "test"}, "task-1")]
+
+    def test_tool_router_execute_runs_target_guardrails_once(self, agent):
+        decision = SimpleNamespace(allows_execution=True)
+        agent._tool_guardrails = SimpleNamespace(before_call=MagicMock(return_value=decision))
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"ok": true}'),
+            patch.object(agent, "_append_guardrail_observation", side_effect=lambda name, args, result, *, failed: result) as after_guardrail,
+        ):
+            result = agent._invoke_tool(
+                "tool_router",
+                {
+                    "action": "execute",
+                    "tool_name": "web_search",
+                    "arguments": {"q": "test"},
+                },
+                "task-1",
+            )
+
+        assert json.loads(result)["success"] is True
+        agent._tool_guardrails.before_call.assert_called_once_with("web_search", {"q": "test"})
+        after_guardrail.assert_called_once()
+        assert after_guardrail.call_args.args == ("web_search", {"q": "test"}, '{"ok": true}')
+        assert after_guardrail.call_args.kwargs == {"failed": False}
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")

@@ -9526,12 +9526,58 @@ Examples:
         help="Platform to apply to (default: cli)",
     )
 
+    tools_telemetry_p = tools_sub.add_parser(
+        "router-telemetry",
+        help="Summarize local tool_router search and execution telemetry",
+    )
+    tools_telemetry_p.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum rows per section (default: 10)",
+    )
+    tools_telemetry_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Print raw JSON summary",
+    )
+
     def cmd_tools(args):
         action = getattr(args, "tools_action", None)
         if action in ("list", "disable", "enable"):
             from hermes_cli.tools_config import tools_disable_enable_command
 
             tools_disable_enable_command(args)
+        elif action == "router-telemetry":
+            from agent.tool_router_telemetry import summarize_router_events
+
+            summary = summarize_router_events(limit=getattr(args, "limit", 10))
+            if getattr(args, "json", False):
+                print(json.dumps(summary, indent=2, ensure_ascii=False))
+                return
+            if not summary.get("success"):
+                print(f"tool_router telemetry unavailable: {summary.get('error')}")
+                return
+            print(f"tool_router telemetry: {summary.get('event_count', 0)} events")
+            print(f"db: {summary.get('db_path')}")
+            unsatisfied = summary.get("unsatisfied") or []
+            if unsatisfied:
+                print("\nUnsatisfied requests:")
+                for row in unsatisfied:
+                    print(
+                        f"  {row.get('count')}x {row.get('outcome')}: "
+                        f"{row.get('request')} (last {row.get('last_seen')})"
+                    )
+            else:
+                print("\nUnsatisfied requests: none")
+            targets = summary.get("top_targets") or []
+            if targets:
+                print("\nTop executed targets:")
+                for row in targets:
+                    print(
+                        f"  {row.get('count')}x {row.get('target_type')}:"
+                        f"{row.get('target')} [{row.get('outcome')}]"
+                    )
         else:
             _require_tty("tools")
             from hermes_cli.tools_config import tools_command

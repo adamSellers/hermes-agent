@@ -2,6 +2,10 @@
 
 Date: 2026-05-03
 
+Status: historical integration note. It records the initial spike and known
+Hermes API constraints; current operator commands and deployed behavior are in
+`docs/cos_memory_deployment.md` and the wrapper repo's `docs/operations.md`.
+
 This note records the Slice 0 integration spike for the chief-of-staff
 memory/context build.
 
@@ -71,4 +75,3 @@ It implements:
 
 Embeddings, durable facts/preferences/commitments, extraction, consolidation,
 and CLI curation are deferred to later slices.
-

@@ -81,6 +81,14 @@ _OLLAMA_TAG_PATTERN = re.compile(
 # `http://100.77.243.5:11434`) wouldn't be treated as local and its stream
 # read / stale timeouts wouldn't get auto-bumped. Built once at import time.
 _TAILSCALE_CGNAT = ipaddress.IPv4Network("100.64.0.0/10")
+_DEFAULT_LOCAL_DNS_SUFFIXES = (
+    ".local",
+    ".lan",
+    ".home",
+    ".internal",
+    ".localdomain",
+    ".oakroad",
+)
 
 
 def _strip_provider_prefix(model: str) -> str:
@@ -360,14 +368,30 @@ def is_local_endpoint(base_url: str) -> bool:
         host = parsed.hostname or ""
     except Exception:
         return False
-    if host in _LOCAL_HOSTS:
+    host_lower = host.lower().rstrip(".")
+    if host_lower in _LOCAL_HOSTS:
         return True
     # Docker / Podman / Lima internal DNS names (e.g. host.docker.internal)
-    if any(host.endswith(suffix) for suffix in _CONTAINER_LOCAL_SUFFIXES):
+    if any(host_lower.endswith(suffix) for suffix in _CONTAINER_LOCAL_SUFFIXES):
+        return True
+    # Home/lab DNS suffixes for LAN-hosted local inference servers.
+    # Users can override these with:
+    #   HERMES_LOCAL_ENDPOINT_SUFFIXES=".local,.lan,.mydomain"
+    raw_suffixes = os.getenv("HERMES_LOCAL_ENDPOINT_SUFFIXES", "")
+    suffixes = [
+        s.strip().lower()
+        for s in raw_suffixes.split(",")
+        if s.strip()
+    ] or list(_DEFAULT_LOCAL_DNS_SUFFIXES)
+    normalized_suffixes = [
+        s if s.startswith(".") else f".{s}"
+        for s in suffixes
+    ]
+    if any(host_lower.endswith(suffix) for suffix in normalized_suffixes):
         return True
     # RFC-1918 private ranges, link-local, and Tailscale CGNAT
     try:
-        addr = ipaddress.ip_address(host)
+        addr = ipaddress.ip_address(host_lower)
         if addr.is_private or addr.is_loopback or addr.is_link_local:
             return True
         if isinstance(addr, ipaddress.IPv4Address) and addr in _TAILSCALE_CGNAT:
@@ -376,7 +400,7 @@ def is_local_endpoint(base_url: str) -> bool:
         pass
     # Bare IP that looks like a private range (e.g. 172.26.x.x for WSL)
     # or Tailscale CGNAT (100.64.x.x–100.127.x.x).
-    parts = host.split(".")
+    parts = host_lower.split(".")
     if len(parts) == 4:
         try:
             first, second = int(parts[0]), int(parts[1])
